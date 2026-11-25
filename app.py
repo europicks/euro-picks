@@ -6,58 +6,296 @@ from io import BytesIO
 
 st.set_page_config(page_title="EURO PICKS", page_icon="🏀", layout="wide")
 
+# --- EURO PICKS access control (Supabase Auth + database-backed Premium) ---
+from supabase import create_client
+from datetime import datetime, timezone, timedelta
+
+
+def get_supabase():
+    try:
+        url = st.secrets["SUPABASE_URL"]
+        key = st.secrets["SUPABASE_PUBLISHABLE_KEY"]
+        return create_client(url, key)
+    except Exception:
+        st.error("Nedostaju Supabase podešavanja. Proveri Streamlit Settings → Secrets.")
+        st.stop()
+
+
+supabase = get_supabase()
+ADMIN_EMAIL = "anjanikolicfakultet@gmail.com"
+
+
+def current_user_client():
+    client = get_supabase()
+    access = st.session_state.get("sb_access_token")
+    refresh = st.session_state.get("sb_refresh_token")
+    if access and refresh:
+        try:
+            client.auth.set_session(access, refresh)
+        except Exception:
+            st.session_state.pop("sb_access_token", None)
+            st.session_state.pop("sb_refresh_token", None)
+            st.session_state.pop("sb_user", None)
+            st.rerun()
+    return client
+
+
+def auth_screen():
+    st.title("🏀 EURO PICKS")
+    st.subheader("Dobro došli")
+    st.write("LIGHT pristup omogućava pregled početne stranice i Premium paketa. Analitika je dostupna Premium članovima.")
+    login_tab, register_tab = st.tabs(["Prijava", "Napravi nalog"])
+    with login_tab:
+        email = st.text_input("Email", key="login_email")
+        password = st.text_input("Lozinka", type="password", key="login_password")
+        if st.button("Prijavi se", type="primary", use_container_width=True):
+            try:
+                result = supabase.auth.sign_in_with_password({"email": email.strip(), "password": password})
+                st.session_state["sb_access_token"] = result.session.access_token
+                st.session_state["sb_refresh_token"] = result.session.refresh_token
+                st.session_state["sb_user"] = {"id": result.user.id, "email": result.user.email}
+                st.rerun()
+            except Exception as e:
+                st.error(f"Prijava nije uspela: {e}")
+    with register_tab:
+        new_email = st.text_input("Email adresa", key="register_email")
+        new_password = st.text_input("Lozinka (najmanje 8 karaktera)", type="password", key="register_password")
+        confirm = st.text_input("Ponovi lozinku", type="password", key="register_confirm")
+        if st.button("Registruj se", use_container_width=True):
+            if not new_email.strip() or len(new_password) < 8:
+                st.warning("Unesi ispravnu email adresu i lozinku od najmanje 8 karaktera.")
+            elif new_password != confirm:
+                st.warning("Lozinke se ne podudaraju.")
+            else:
+                try:
+                    result = supabase.auth.sign_up({"email": new_email.strip(), "password": new_password})
+                    if result.session:
+                        st.session_state["sb_access_token"] = result.session.access_token
+                        st.session_state["sb_refresh_token"] = result.session.refresh_token
+                        st.session_state["sb_user"] = {"id": result.user.id, "email": result.user.email}
+                        st.rerun()
+                    else:
+                        st.success("Nalog je napravljen. Proveri email i potvrdi adresu, pa se prijavi.")
+                except Exception as e:
+                    st.error(f"Registracija nije uspela: {e}")
+
+
+if not st.session_state.get("sb_access_token"):
+    auth_screen()
+    st.stop()
+
+sb = current_user_client()
+user = st.session_state.get("sb_user") or {}
+user_email = (user.get("email") or "").lower()
+user_id = user.get("id")
+try:
+    profile_result = sb.table("profiles").select("role,premium_until,is_blocked").eq("id", user_id).single().execute()
+    profile = profile_result.data or {}
+except Exception:
+    profile = {}
+
+if profile.get("is_blocked"):
+    st.error("Ovaj nalog je blokiran. Kontaktiraj EURO PICKS administraciju.")
+    if st.button("Odjavi se"):
+        st.session_state.clear()
+        st.rerun()
+    st.stop()
+
+is_admin = profile.get("role") == "admin" and user_email == ADMIN_EMAIL
+premium_until = profile.get("premium_until")
+try:
+    is_premium = bool(premium_until and datetime.fromisoformat(premium_until.replace("Z", "+00:00")) > datetime.now(timezone.utc))
+except Exception:
+    is_premium = False
+
+with st.sidebar:
+    st.caption(f"Prijavljen: {user_email}")
+    st.caption("ADMIN" if is_admin else ("PREMIUM" if is_premium else "LIGHT"))
+    if st.button("Odjavi se", key="logout_button"):
+        try:
+            sb.auth.sign_out()
+        except Exception:
+            pass
+        for key in ["sb_access_token", "sb_refresh_token", "sb_user"]:
+            st.session_state.pop(key, None)
+        st.rerun()
+
+if not is_admin and not is_premium:
+    st.title("🏀 EURO PICKS")
+    st.subheader("LIGHT članstvo")
+    st.write("Dobro došao/la u EURO PICKS. Analitika igrača, utakmica i protivnika dostupna je Premium članovima.")
+    st.markdown("### Izaberi Premium paket")
+    plans = {
+        "Premium – 1 mesec": 30,
+        "Premium – 3 meseca": 90,
+        "Premium – 12 meseci": 365,
+    }
+    chosen_plan = st.radio("Trajanje članstva", list(plans), horizontal=True)
+    st.info("Nakon slanja zahteva dobićeš instrukcije za uplatu. Premium se aktivira tek kada administracija proveri uplatu.")
+    payment_email = st.text_input("Email za kontakt", value=user_email)
+    payment_note = st.text_input("Napomena (opciono)", placeholder="Npr. ime uplatioca")
+    if st.button("Zatraži Premium pristup", type="primary", use_container_width=True):
+        if not payment_email.strip():
+            st.warning("Unesi email adresu.")
+        else:
+            try:
+                sb.table("premium_requests").insert({
+                    "user_id": user_id,
+                    "email": payment_email.strip(),
+                    "plan": chosen_plan,
+                    "duration_days": plans[chosen_plan],
+                    "note": payment_note.strip(),
+                    "status": "pending",
+                }).execute()
+                st.success("Zahtev je poslat. Sačekaj instrukcije za uplatu i potvrdu administracije.")
+            except Exception as e:
+                st.error(f"Zahtev nije sačuvan. Proveri da li je SQL podešavanje završeno: {e}")
+    st.markdown("---")
+    st.caption("Premium paketi: 30, 90 ili 365 dana. Pristup se aktivira ručno nakon potvrde uplate.")
+    st.stop()
+
+if is_admin:
+    with st.expander("⚙️ ADMIN PANEL – Premium zahtevi", expanded=True):
+        st.subheader("Zahtevi za Premium")
+        try:
+            reqs = sb.table("premium_requests").select("id,user_id,email,plan,duration_days,note,status,created_at").order("created_at", desc=True).execute().data or []
+        except Exception as e:
+            reqs = []
+            st.error(f"Ne mogu da učitam zahteve: {e}")
+        if not reqs:
+            st.info("Trenutno nema Premium zahteva.")
+        for req in reqs:
+            with st.container(border=True):
+                st.write(f"**{req.get('email')}** · {req.get('plan')} · Status: **{req.get('status')}**")
+                if req.get("note"):
+                    st.caption("Napomena: " + req["note"])
+                c1, c2 = st.columns(2)
+                if req.get("status") == "pending":
+                    if c1.button("Odobri uplatu", key=f"approve_{req['id']}", type="primary"):
+                        try:
+                            now = datetime.now(timezone.utc)
+                            old = sb.table("profiles").select("premium_until").eq("id", req["user_id"]).single().execute().data or {}
+                            old_until = old.get("premium_until")
+                            try:
+                                old_dt = datetime.fromisoformat(old_until.replace("Z", "+00:00")) if old_until else now
+                            except Exception:
+                                old_dt = now
+                            start = max(now, old_dt)
+                            until = start + timedelta(days=int(req["duration_days"]))
+                            sb.table("profiles").update({"premium_until": until.isoformat(), "is_blocked": False}).eq("id", req["user_id"]).execute()
+                            sb.table("premium_requests").update({"status": "approved", "reviewed_at": now.isoformat()}).eq("id", req["id"]).execute()
+                            st.success(f"Premium aktiviran do {until.strftime('%d.%m.%Y')}.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Odobravanje nije uspelo: {e}")
+                    if c2.button("Odbij", key=f"reject_{req['id']}"):
+                        try:
+                            sb.table("premium_requests").update({"status": "rejected", "reviewed_at": datetime.now(timezone.utc).isoformat()}).eq("id", req["id"]).execute()
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Odbijanje nije uspelo: {e}")
+        st.markdown("#### Upravljanje korisnikom")
+        target_email = st.text_input("Email korisnika za produženje ili blokadu", key="admin_target_email")
+        extra_days = st.selectbox("Produži Premium za", [30, 90, 365], format_func=lambda x: {30:"30 dana",90:"90 dana",365:"365 dana"}[x])
+        ac1, ac2 = st.columns(2)
+        if ac1.button("Produži Premium") and target_email.strip():
+            try:
+                found = sb.table("profiles").select("id,premium_until").eq("email", target_email.strip().lower()).single().execute().data
+                now = datetime.now(timezone.utc)
+                try:
+                    old_dt = datetime.fromisoformat(found["premium_until"].replace("Z", "+00:00")) if found.get("premium_until") else now
+                except Exception:
+                    old_dt = now
+                until = max(now, old_dt) + timedelta(days=extra_days)
+                sb.table("profiles").update({"premium_until": until.isoformat()}).eq("id", found["id"]).execute()
+                st.success(f"Premium produžen do {until.strftime('%d.%m.%Y')}.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Korisnik nije pronađen ili izmena nije uspela: {e}")
+        if ac2.button("Blokiraj nalog") and target_email.strip():
+            try:
+                found = sb.table("profiles").select("id").eq("email", target_email.strip().lower()).single().execute().data
+                sb.table("profiles").update({"is_blocked": True, "premium_until": None}).eq("id", found["id"]).execute()
+                st.success("Nalog je blokiran.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Korisnik nije pronađen ili izmena nije uspela: {e}")
+
+if not is_admin and not is_premium:
+    st.stop()
+
+
 st.markdown("""
 <style>
-.stApp {background:#f4f7fb;color:#172033}
-[data-testid="stHeader"] {background:rgba(244,247,251,.96)}
-[data-testid="stSidebar"] {background:#e8eef7}
-[data-testid="stSidebar"] * {color:#172033 !important}
-h1,h2,h3,h4,p,label,span,div {color:inherit}
-.stApp h1,.stApp h2,.stApp h3,.stApp h4 {color:#14213d !important}
-.stApp p,.stApp label,.stApp [data-testid="stCaptionContainer"] {color:#334155}
-div[data-testid="stMetric"] {background:#ffffff;padding:14px;border-radius:12px;border:1px solid #d6deea;box-shadow:0 2px 8px rgba(20,33,61,.06)}
-div[data-testid="stMetric"] label,
-div[data-testid="stMetric"] [data-testid="stMetricValue"],
-div[data-testid="stMetric"] [data-testid="stMetricDelta"] {
-    color:#172033 !important;
-}
-div[data-testid="stMetric"] [data-testid="stMetricDelta"] {
-    background:#e8edf5 !important;
-    border:1px solid #cbd5e1 !important;
-    border-radius:999px !important;
-    padding:4px 9px !important;
-}
-div[data-testid="stMetric"] [data-testid="stMetricDelta"] svg {
-    fill:#334155 !important;
-}
-.stApp input, .stApp textarea,
-.stApp [data-baseweb="select"] > div {
-    background:#ffffff !important;
-    color:#172033 !important;
-    border-color:#cbd5e1 !important;
-}
-.stApp input::placeholder, .stApp textarea::placeholder {
-    color:#64748b !important;
-}
-.stApp [data-baseweb="select"] * {
-    color:#172033 !important;
-}
-.stTabs [data-baseweb="tab-list"] {gap:8px}
-.stTabs [data-baseweb="tab"] {background:#e7edf6;border-radius:8px;color:#172033}
-.stTabs [aria-selected="true"] {background:#cbdcf2 !important;color:#102a43 !important}
-[data-testid="stDataFrame"] {background:#fff}
-.stAlert {background:#fff;border:1px solid #d6deea}
+.stApp {background: radial-gradient(circle at 12% 0%, #14233d 0%, #080d18 48%, #070b13 100%); color:#eef4ff}
+[data-testid="stHeader"] {background:rgba(7,11,19,.92)}
+[data-testid="stSidebar"] {background:#0d1728; border-right:1px solid #20334e}
+[data-testid="stSidebar"] * {color:#e8f0ff !important}
+.stApp h1,.stApp h2,.stApp h3,.stApp h4 {color:#f4f8ff !important}
+.stApp p,.stApp label,.stApp [data-testid="stCaptionContainer"] {color:#b7c6dc}
+div[data-testid="stMetric"] {background:linear-gradient(145deg,#14243b,#101b2e);padding:16px;border-radius:14px;border:1px solid #263d5b;box-shadow:0 5px 18px rgba(0,0,0,.22)}
+div[data-testid="stMetric"] label {color:#9fb4cf !important}
+div[data-testid="stMetric"] [data-testid="stMetricValue"] {color:#f4f8ff !important}
+div[data-testid="stMetric"] [data-testid="stMetricDelta"] {color:#31e69a !important;background:#123b34;border-radius:999px;padding:3px 8px}
+.stApp input,.stApp textarea,[data-baseweb="select"] > div {background:#101c2e !important;color:#f4f8ff !important;border-color:#29415f !important}
+.stApp [data-baseweb="select"] * {color:#f4f8ff !important}
+.stTabs [data-baseweb="tab-list"] {gap:8px;border-bottom:1px solid #263d5b}
+.stTabs [data-baseweb="tab"] {background:#122139;border-radius:9px 9px 0 0;color:#c7d5e8}
+.stTabs [aria-selected="true"] {background:#183b36 !important;color:#42e6a0 !important}
+[data-testid="stDataFrame"] {background:#101b2e}
+.stAlert {background:#122139;border:1px solid #29415f;color:#eaf2ff}
+button[kind="primary"] {background:#20d995 !important;color:#07130f !important;border:0}
+hr {border-color:#263d5b}
 </style>
 """, unsafe_allow_html=True)
 
 st.title("🏀 EURO PICKS")
-st.caption("Basketball player analytics • EuroLeague historical box scores")
+st.caption("EUROPE + GLOBAL BASKETBALL ANALYTICS • trenutno aktivan verifikovan izvor: EuroLeague")
+
+show_upcoming_database_games()
+
+# --- GLOBAL PLAYER DATABASE (SportAPI.ai data ingested by GitHub Actions) ---
+st.markdown("### 🌍 Globalna baza igrača i statistika")
+st.caption("Podaci iz povezanih takmičenja. Baza se puni automatski preko GitHub Actions; ponude kladionica se prikazuju samo ako postoje u bazi.")
+try:
+    db_players = sb.table("players").select("id,full_name,source").order("full_name").limit(5000).execute().data or []
+except Exception as exc:
+    db_players = []
+    st.info(f"Globalni katalog još nije dostupan: {exc}")
+if db_players:
+    player_lookup = {p["id"]: p for p in db_players}
+    selected_global_id = st.selectbox("Pronađi igrača u globalnoj bazi", list(player_lookup), format_func=lambda pid: player_lookup[pid]["full_name"], key="global_player_select")
+    try:
+        box_rows = sb.table("player_boxscores").select("game_id,player_id,team_id,minutes,pts,reb,ast,threes_made,stl,blk,tov,pir,updated_at").eq("player_id", selected_global_id).order("updated_at", desc=True).limit(100).execute().data or []
+        offers_rows = sb.table("player_prop_offers").select("market,line,bookmaker,over_odds,under_odds,captured_at,source").eq("player_id", selected_global_id).eq("is_current", True).order("captured_at", desc=True).limit(100).execute().data or []
+    except Exception as exc:
+        box_rows, offers_rows = [], []
+        st.warning(f"Ne mogu da učitam profil igrača: {exc}")
+    st.subheader(player_lookup[selected_global_id]["full_name"])
+    if box_rows:
+        bx = pd.DataFrame(box_rows)
+        for col in ["pts","reb","ast","threes_made","stl","blk","tov","pir","minutes"]:
+            if col in bx: bx[col] = pd.to_numeric(bx[col], errors="coerce")
+        kcols = st.columns(5)
+        for c, label, field in zip(kcols, ["PTS L10","REB L10","AST L10","3PM L10","PIR L10"], ["pts","reb","ast","threes_made","pir"]):
+            c.metric(label, f"{bx[field].head(10).mean():.1f}" if bx[field].notna().any() else "—")
+        st.markdown("#### Poslednji evidentirani nastupi")
+        st.dataframe(bx.head(20), use_container_width=True, hide_index=True)
+    else:
+        st.info("Za ovog igrača još nema preuzetih box score nastupa. To nije nula statistike — podaci nisu dostupni u bazi.")
+    st.markdown("#### 🎯 Granice kladionica na profilu igrača")
+    if offers_rows:
+        st.dataframe(pd.DataFrame(offers_rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("Trenutno nema potvrđenih player-prop ponuda za ovog igrača. Ne prikazujemo izmišljene granice.")
+else:
+    st.info("Globalna baza je prazna. Kada dodaš besplatan SportAPI ključ u GitHub Secrets i pokreneš workflow, ovde će se pojaviti igrači i utakmice iz takmičenja koja taj izvor pokriva.")
 
 YEARS = list(range(2026, 2006, -1))
 BASE = "https://675hoops.com/downloads/player_box-{}.csv.gz"
 TEAM_BASE = "https://675hoops.com/downloads/team_games-{}.csv.gz"
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def load_seasons(years):
     frames, team_frames, errors = [], [], []
     for year in years:
@@ -83,7 +321,7 @@ def load_seasons(years):
     team_data = pd.concat(team_frames, ignore_index=True) if team_frames else pd.DataFrame()
     return data, team_data, errors
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def load_data():
     return load_seasons(YEARS)
 
@@ -96,7 +334,75 @@ def avg(df, col):
 def fmt(x):
     return f"{x:.1f}"
 
-with st.spinner("Preuzimam istorijske box score podatke..."):
+
+def fetch_db_player_offers(player_name):
+    """Fetch current offers stored in Supabase for the selected global player."""
+    try:
+        matches = (sb.table("players").select("id,full_name")
+                   .ilike("full_name", player_name).limit(5).execute().data or [])
+        ids = [row["id"] for row in matches if row.get("id")]
+        if not ids:
+            return pd.DataFrame(), "Igrač još nije povezan sa globalnim katalogom igrača."
+        offers = (sb.table("player_prop_offers")
+                  .select("market,line,bookmaker,over_odds,under_odds,captured_at,game_id,source")
+                  .in_("player_id", ids).eq("is_current", True)
+                  .order("captured_at", desc=True).limit(100).execute().data or [])
+        return pd.DataFrame(offers), None
+    except Exception as exc:
+        return pd.DataFrame(), f"Ponude iz baze trenutno nisu dostupne: {exc}"
+
+
+def show_upcoming_database_games():
+    """Show upcoming fixtures already ingested into the global Supabase schema."""
+    st.markdown("### 🗓️ Predstojeće utakmice")
+    try:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        games = (sb.table("games").select(
+            "id,start_time,status,home_score,away_score,home_team_id,away_team_id,competition_season_id"
+        ).gte("start_time", now_iso).order("start_time").limit(50).execute().data or [])
+        if not games:
+            st.info("Još nema predstojećih utakmica u globalnoj bazi. Raspored će se prikazati kada se poveže i pokrene izvor za to takmičenje.")
+            return
+        team_ids = list({x for g in games for x in [g.get("home_team_id"), g.get("away_team_id")] if x})
+        teams = sb.table("teams").select("id,name").in_("id", team_ids).execute().data or [] if team_ids else []
+        team_map = {t["id"]: t["name"] for t in teams}
+        rows = []
+        for g in games:
+            rows.append({
+                "Početak": g.get("start_time"),
+                "Domaćin": team_map.get(g.get("home_team_id"), g.get("home_team_id")),
+                "Gost": team_map.get(g.get("away_team_id"), g.get("away_team_id")),
+                "Status": g.get("status") or "scheduled",
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    except Exception as exc:
+        st.warning(f"Raspored iz globalne baze nije dostupan: {exc}")
+
+refresh_col1, refresh_col2 = st.columns([3, 1])
+with refresh_col1:
+    st.caption("Aplikacija proverava izvor na svakih 15 minuta dok se koristi. Novi podaci se pojavljuju tek kada ih izvor objavi.")
+with refresh_col2:
+    if st.button("🔄 Osveži podatke sada", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
+
+COMPETITIONS = ["EuroLeague", "EuroCup", "ABA liga", "NBA", "WNBA", "NCAA", "Ostale evropske lige"]
+with st.sidebar:
+    st.header("🏆 Takmičenje")
+    chosen_competition = st.selectbox("Izaberi ligu", COMPETITIONS, index=0)
+
+if chosen_competition != "EuroLeague":
+    st.title("🏀 EURO PICKS")
+    st.subheader(chosen_competition)
+    st.info(
+        f"Izabrano takmičenje: {chosen_competition}. Ovaj izvor još nije povezan sa bazom rezultata. "
+        "Ne prikazujemo podatke druge lige kao da pripadaju ovom takmičenju. "
+        "Kada povežemo verifikovan izvor box score podataka, analitika će se automatski pojaviti ovde."
+    )
+    st.markdown("**Planirana podrška:** raspored, igrači, box score, forma, protivnici i istorijska analiza granica.")
+    st.stop()
+
+with st.spinner("Proveravam najnovije objavljene box score podatke..."):
     try:
         all_data, team_data, load_errors = load_data()
     except Exception as e:
@@ -137,6 +443,7 @@ if not team_data.empty:
     team_data = team_data.dropna(subset=["date", "team", "opponent"])
 
 st.success(f"Podaci učitani: {len(all_data):,} nastupa • {all_data['player'].nunique():,} igrača • {all_data['season_label'].nunique()} sezona")
+st.caption("Provera izvora: na 15 minuta dok se aplikacija koristi. Izvor 6.75 objavljuje dnevne skupove podataka, pa završni box score ne mora biti dostupan odmah po završetku utakmice.")
 
 with st.sidebar:
     st.header("🔎 Filteri")
@@ -185,7 +492,7 @@ b.metric("Minuta", fmt(avg(player_df, "min")))
 c.metric("FG%", fmt(100 * safe_num(player_df["fgm"]).sum() / max(1, safe_num(player_df["fga"]).sum())))
 d.metric("3P%", fmt(100 * safe_num(player_df["3pm"]).sum() / max(1, safe_num(player_df["3pa"]).sum())))
 
-tabs = st.tabs(["Pregled", "Poslednje utakmice", "Protivnici", "Odbrana protivnika", "Granice / prop analiza"])
+tabs = st.tabs(["Pregled", "Poslednje utakmice", "Protivnici", "Odbrana protivnika"])
 
 with tabs[0]:
     chart_stat = st.selectbox("Statistika za grafikon", ["Poeni", "Skokovi", "Asistencije", "Trojke", "PIR"], key="chart_stat")
@@ -397,26 +704,65 @@ with tabs[3]:
             )
 
 
-with tabs[4]:
-    st.caption("Ovo su istorijske frekvencije, ne garantovana prognoza. Linija se poredi sa stvarnim rezultatima u izabranom uzorku.")
-    prop_label = st.selectbox("Tržište", ["Poeni","Skokovi","Asistencije","Trojke","PIR"])
-    prop_col = {"Poeni":"pts","Skokovi":"reb","Asistencije":"ast","Trojke":"3pm","PIR":"pir"}[prop_label]
-    line = st.number_input("Granica", min_value=0.5, max_value=100.5, value=15.5, step=0.5)
-    sample_choice = st.selectbox("Uzorak", ["Poslednjih 5","Poslednjih 10","Sve utakmice"])
-    sample = player_df.head(5 if sample_choice=="Poslednjih 5" else 10) if sample_choice!="Sve utakmice" else player_df
-    over_count = int((safe_num(sample[prop_col]) > line).sum())
-    under_count = int((safe_num(sample[prop_col]) < line).sum())
-    pushes = int((safe_num(sample[prop_col]) == line).sum())
-    n = len(sample)
-    x1, x2, x3 = st.columns(3)
-    x1.metric("Over", f"{over_count}/{n}", f"{100*over_count/max(1,n):.0f}%")
-    x2.metric("Under", f"{under_count}/{n}", f"{100*under_count/max(1,n):.0f}%")
-    x3.metric("Jednako", pushes)
-    st.write(f"Prosek u uzorku: **{avg(sample,prop_col):.2f}** | Medijana: **{safe_num(sample[prop_col]).median():.1f}**")
-    st.dataframe(sample[["date","opponent",prop_col]].rename(
-        columns={"date":"Datum","opponent":"Protivnik",prop_col:prop_label}),
-        use_container_width=True, hide_index=True)
 
+st.markdown("### 📈 Granice kladionica za ovog igrača")
+st.caption("Granice se prikazuju direktno na profilu igrača. Prikazujemo samo stvarne podatke iz baze ili CSV uvoza; ne izmišljamo kvote.")
+db_offers, offers_error = fetch_db_player_offers(chosen_player)
+if offers_error:
+    st.info(offers_error)
+elif not db_offers.empty:
+    st.markdown("#### Aktuelne ponude sačuvane u EURO PICKS bazi")
+    db_offers = db_offers.rename(columns={
+        "market":"Tržište", "line":"Granica", "bookmaker":"Kladionica",
+        "over_odds":"OVER kvota", "under_odds":"UNDER kvota",
+        "captured_at":"Vreme preuzimanja", "game_id":"ID utakmice", "source":"Izvor"
+    })
+    st.dataframe(db_offers, use_container_width=True, hide_index=True)
+else:
+    st.info("Za ovog igrača trenutno nema sačuvanih ponuda kladionica. Istorijska analiza granice i dalje može da se izračuna ručnim unosom linije ispod.")
+with st.expander("📥 Privremeno testiraj granice iz CSV fajla", expanded=False):
+    st.write("CSV kolone: player, market, line, bookmaker, over_odds, under_odds. Ovo je samo privremeni prikaz u ovoj sesiji; trajni unos zahteva ovlašćeni importer koji upisuje u Supabase.")
+    odds_file = st.file_uploader("Učitaj CSV sa granicama", type=["csv"], key="bookmaker_odds_csv")
+    if odds_file is not None:
+        try:
+            odds_df = pd.read_csv(odds_file)
+            required_odds = {"player", "market", "line", "bookmaker"}
+            if not required_odds.issubset(odds_df.columns):
+                st.error("CSV mora sadržati: player, market, line, bookmaker.")
+            else:
+                odds_df["line"] = pd.to_numeric(odds_df["line"], errors="coerce")
+                odds_df = odds_df.dropna(subset=["line"])
+                player_odds = odds_df[odds_df["player"].astype(str).str.casefold() == str(chosen_player).casefold()].copy()
+                if not player_odds.empty:
+                    st.markdown("**Ponude za izabranog igrača**")
+                    display_cols = [c for c in ["bookmaker", "market", "line", "over_odds", "under_odds", "updated_at"] if c in player_odds.columns]
+                    st.dataframe(player_odds[display_cols], use_container_width=True, hide_index=True)
+                else:
+                    st.info("U CSV fajlu nema granica za ovog igrača.")
+        except Exception as exc:
+            st.error(f"CSV nije moguće učitati: {exc}")
+st.caption("Istorijski rezultati se porede sa svakom pojedinačnom linijom.")
+prop_label = st.selectbox("Statistika za poređenje", ["Poeni", "Skokovi", "Asistencije", "Trojke", "PIR", "PTS + REB", "PTS + AST", "REB + AST", "PRA"])
+combo_cols = {"PTS + REB": ("pts", "reb"), "PTS + AST": ("pts", "ast"), "REB + AST": ("reb", "ast"), "PRA": ("pts", "reb", "ast")}
+if prop_label in combo_cols:
+    prop_col = "_prop_combo"
+    player_df[prop_col] = sum(safe_num(player_df[c]) for c in combo_cols[prop_label])
+else:
+    prop_col = {"Poeni":"pts", "Skokovi":"reb", "Asistencije":"ast", "Trojke":"3pm", "PIR":"pir"}[prop_label]
+line = st.number_input("Granica za istorijsko poređenje", min_value=0.5, max_value=100.5, value=15.5, step=0.5)
+sample_choice = st.selectbox("Period", ["Poslednjih 5", "Poslednjih 10", "Poslednjih 20", "Sve utakmice"])
+sample_n = {"Poslednjih 5":5, "Poslednjih 10":10, "Poslednjih 20":20}
+sample = player_df.head(sample_n[sample_choice]) if sample_choice in sample_n else player_df
+over_count = int((safe_num(sample[prop_col]) > line).sum())
+under_count = int((safe_num(sample[prop_col]) < line).sum())
+pushes = int((safe_num(sample[prop_col]) == line).sum())
+n = len(sample)
+x1, x2, x3 = st.columns(3)
+x1.metric("OVER – prebacio", f"{over_count}/{n}", f"{100*over_count/max(1,n):.0f}%")
+x2.metric("UNDER – nije prebacio", f"{under_count}/{n}", f"{100*under_count/max(1,n):.0f}%")
+x3.metric("Tačno na granici", pushes)
+st.write(f"Prosek u uzorku: **{avg(sample, prop_col):.2f}** | Medijana: **{safe_num(sample[prop_col]).median():.1f}**")
+st.dataframe(sample[["date", "opponent", prop_col]].rename(columns={"date":"Datum", "opponent":"Protivnik", prop_col:prop_label}), use_container_width=True, hide_index=True)
 
 
 st.markdown("---")
