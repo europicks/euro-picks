@@ -252,8 +252,6 @@ hr {border-color:#263d5b}
 st.title("🏀 EURO PICKS")
 st.caption("EUROPE + GLOBAL BASKETBALL ANALYTICS • trenutno aktivan verifikovan izvor: EuroLeague")
 
-show_upcoming_database_games()
-
 # --- GLOBAL PLAYER DATABASE (SportAPI.ai data ingested by GitHub Actions) ---
 st.markdown("### 🌍 Globalna baza igrača i statistika")
 st.caption("Podaci iz povezanih takmičenja. Baza se puni automatski preko GitHub Actions; ponude kladionica se prikazuju samo ako postoje u bazi.")
@@ -377,6 +375,10 @@ def show_upcoming_database_games():
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
     except Exception as exc:
         st.warning(f"Raspored iz globalne baze nije dostupan: {exc}")
+
+
+# Poziv funkcije ide tek nakon njene definicije.
+show_upcoming_database_games()
 
 refresh_col1, refresh_col2 = st.columns([3, 1])
 with refresh_col1:
