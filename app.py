@@ -381,95 +381,82 @@ def normalize_player_name(value):
     return re.sub(r"[^a-z0-9]", "", value.lower())
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
+@st.cache_data(ttl=21600, show_spinner=False)
 def load_euroleague_player_images(season_code):
-    """Fetch official EuroLeague player portraits from the documented api-live v2 API.
+    """Fetch official EuroLeague player portraits from the v3 stats feed.
 
-    The season-wide people endpoint can be empty for an active season, so always
-    supplement it with per-club rosters. Cache the resulting name -> image map for 24h.
+    Do not cache empty/error responses: a temporary upstream failure must not
+    leave every player with a placeholder for 24 hours.
     """
-    base = "https://api-live.euroleague.net/v2"
-    headers = {"User-Agent": "Mozilla/5.0 EURO-PICKS/1.0", "Accept": "application/json"}
+    url = "https://api-live.euroleague.net/v3/competitions/E/statistics/players/traditional"
+    params = {
+        "SeasonMode": "Single",
+        "SeasonCode": str(season_code),
+        "statisticMode": "PerGame",
+        "limit": 500,
+        "offset": 0,
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; EURO-PICKS/1.0)",
+        "Accept": "application/json, text/plain, */*",
+        "Origin": "https://www.euroleaguebasketball.net",
+        "Referer": "https://www.euroleaguebasketball.net/",
+    }
+    response = requests.get(url, params=params, headers=headers, timeout=(8, 25))
+    response.raise_for_status()
+    payload = response.json()
 
-    def get_json(url):
-        response = requests.get(url, headers=headers, timeout=15)
-        response.raise_for_status()
-        return response.json()
-
-    def rows_from(payload):
-        if isinstance(payload, list):
-            return payload
-        if isinstance(payload, dict):
-            for key in ("data", "items", "people", "results", "clubs"):
-                value = payload.get(key)
-                if isinstance(value, list):
-                    return value
-        return []
-
-    def normalize_url(value):
-        if not isinstance(value, str) or not value.strip():
-            return None
-        value = value.strip()
-        if value.startswith("//"):
-            value = "https:" + value
-        elif value.startswith("http://"):
-            value = "https://" + value[7:]
-        elif value.startswith("/"):
-            value = "https://api-live.euroleague.net" + value
-        return value if value.startswith("https://") else None
-
-    def row_name(row):
-        person = row.get("person") if isinstance(row.get("person"), dict) else {}
-        name = (row.get("player_name") or row.get("person_name") or row.get("personName")
-                or row.get("name") or person.get("name") or person.get("personName")
-                or person.get("person_name"))
-        if isinstance(name, str) and "," in name:
-            surname, first = [part.strip() for part in name.split(",", 1)]
-            name = f"{first} {surname}"
-        return name.strip() if isinstance(name, str) and name.strip() else None
-
-    def add_rows(image_map, rows):
-        added = 0
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            if row.get("type") not in (None, "J", "PLAYER", "Player"):
-                continue
-            name = row_name(row)
-            image_url = normalize_url(row.get("player_image_url") or row.get("image_url")
-                                       or row.get("photoUrl") or row.get("person_image_url"))
-            if name and image_url:
-                image_map[normalize_player_name(name)] = image_url
-                added += 1
-        return added
+    # The feed's envelope has changed between releases. Walk the full JSON tree
+    # rather than assuming the records always sit at payload['data'].
+    records = []
+    def walk(node):
+        if isinstance(node, dict):
+            records.append(node)
+            for value in node.values():
+                if isinstance(value, (dict, list)):
+                    walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+    walk(payload)
 
     image_map = {}
-    people_url = f"{base}/competitions/E/seasons/{season_code}/people"
-    try:
-        add_rows(image_map, rows_from(get_json(people_url)))
-    except Exception:
-        pass
-
-    # Do this even if the aggregate endpoint returned some images: it may be partial.
-    clubs_url = f"{base}/competitions/E/seasons/{season_code}/clubs"
-    try:
-        clubs = rows_from(get_json(clubs_url))
-    except Exception:
-        clubs = []
-
-    for club in clubs:
-        if not isinstance(club, dict):
+    for row in records:
+        name = (row.get("player_name") or row.get("playerName") or
+                row.get("person_name") or row.get("personName") or row.get("name"))
+        image_url = (row.get("player_image_url") or row.get("playerImageUrl") or
+                     row.get("person_image_url") or row.get("personImageUrl") or
+                     row.get("image_url") or row.get("imageUrl"))
+        if not name or not image_url:
             continue
-        club_code = (club.get("club_code") or club.get("code") or club.get("clubCode")
-                     or club.get("permanentCode"))
-        if not club_code:
-            continue
-        roster_url = f"{base}/competitions/E/seasons/{season_code}/clubs/{club_code}/people"
-        try:
-            add_rows(image_map, rows_from(get_json(roster_url)))
-        except Exception:
-            continue
+        image_url = str(image_url).strip()
+        if image_url.startswith("//"):
+            image_url = "https:" + image_url
+        elif image_url.startswith("http://"):
+            image_url = "https://" + image_url[7:]
+        elif image_url.startswith("/"):
+            image_url = "https://api-live.euroleague.net" + image_url
+        if image_url.startswith("https://"):
+            # Store common name variants as aliases. Historical box-score feeds
+            # sometimes abbreviate first names or reverse first/last name order.
+            raw_name = str(name).strip()
+            tokens = raw_name.split()
+            aliases = {normalize_player_name(raw_name)}
+            if len(tokens) >= 2:
+                aliases.add(normalize_player_name(" ".join(reversed(tokens))))
+                aliases.add(normalize_player_name(" ".join(tokens[-1:] + tokens[:-1])))
+                aliases.add(normalize_player_name(tokens[0][0] + " " + " ".join(tokens[1:])))
+            for alias in aliases:
+                if alias:
+                    image_map.setdefault(alias, image_url)
 
+    # Raising prevents Streamlit from caching an empty result after an upstream
+    # hiccup or a season-code mismatch.
+    if not image_map:
+        raise RuntimeError(
+            f"EuroLeague API je odgovorio, ali nije vratio player_image_url za {season_code}. "
+            f"HTTP {response.status_code}; odgovor: {str(payload)[:350]}"
+        )
     return image_map
 
 
@@ -622,16 +609,36 @@ with st.sidebar:
 # Official portraits are retrieved separately from SportAPI and cached for 24 hours.
 image_season = chosen_season if chosen_season != "Sve sezone" else (seasons[0] if seasons else None)
 player_image_map = {}
-try:
-    if image_season:
-        player_image_map = load_euroleague_player_images(selected_season_code(image_season))
-except Exception as image_error:
-    st.caption("Fotografije igrača trenutno nisu dostupne; statistika i analiza rade normalno.")
+image_source_season = selected_season_code(image_season) if image_season else None
+image_error_message = None
+if image_source_season:
+    # CSV season labels can represent either the ending calendar year or the
+    # season start year. Try the selected code first, then the adjacent season.
+    year_match = re.search(r"(20\d{2})", image_source_season)
+    candidate_codes = [image_source_season]
+    if year_match:
+        y = int(year_match.group(1))
+        candidate_codes.extend([f"E{y-1}", f"E{y+1}"])
+    tried_codes = []
+    for candidate in dict.fromkeys(candidate_codes):
+        tried_codes.append(candidate)
+        try:
+            player_image_map = load_euroleague_player_images(candidate)
+            image_source_season = candidate
+            break
+        except Exception as image_error:
+            image_error_message = str(image_error)
+
+if not player_image_map and image_error_message:
+    st.warning(
+        "Fotografije trenutno nisu vraćene iz EuroLeague izvora. "
+        f"Proverene sezone: {', '.join(tried_codes)}. Detalj: {image_error_message}"
+    )
 
 # Player directory: each filtered player is shown beside their official portrait.
 image_matches = sum(1 for player_name in players if player_image_map.get(normalize_player_name(player_name)))
 with st.expander("📸 Igrači i fotografije", expanded=False):
-    st.caption(f"Učitane fotografije: {image_matches} od {len(players)} igrača · izvor: EuroLeague API")
+    st.caption(f"Učitane fotografije: {image_matches} od {len(players)} igrača · izvor: EuroLeague API · sezona: {image_source_season or '—'}")
     directory_rows = []
     for player_name in players:
         portrait = player_image_map.get(normalize_player_name(player_name))
