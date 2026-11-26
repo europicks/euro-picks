@@ -679,14 +679,35 @@ player_portrait_html = (
 team_html = html.escape(str(latest["team"]))
 opp_html = html.escape(str(latest["opponent"]))
 date_text = latest["date"].strftime("%d.%m.%Y") if pd.notna(latest["date"]) else "Datum nije dostupan"
+
+# Resolve the actual final score from the team-game feed. Each game normally
+# has one row per team; never invent a score when the feed has no matching rows.
+score_left = score_right = "N/A"
+if not team_data.empty and {"date", "team", "opponent", "pts"}.issubset(team_data.columns) and pd.notna(latest["date"]):
+    game_date = pd.Timestamp(latest["date"]).normalize()
+    same_day = team_data[team_data["date"].dt.normalize() == game_date].copy()
+    team_key = str(latest["team"]).strip().casefold()
+    opp_key = str(latest["opponent"]).strip().casefold()
+    same_day["_team_key"] = same_day["team"].astype(str).str.strip().str.casefold()
+    same_day["_opp_key"] = same_day["opponent"].astype(str).str.strip().str.casefold()
+    own_rows = same_day[(same_day["_team_key"] == team_key) & (same_day["_opp_key"] == opp_key)]
+    opp_rows = same_day[(same_day["_team_key"] == opp_key) & (same_day["_opp_key"] == team_key)]
+    if not own_rows.empty and not opp_rows.empty:
+        own_score = pd.to_numeric(own_rows.iloc[0]["pts"], errors="coerce")
+        opponent_score = pd.to_numeric(opp_rows.iloc[0]["pts"], errors="coerce")
+        if pd.notna(own_score) and pd.notna(opponent_score):
+            score_left, score_right = str(int(own_score)), str(int(opponent_score))
+score_left_html = html.escape(score_left)
+score_right_html = html.escape(score_right)
 st.markdown(f"""
 <div class="ep-hero">
   <div style="display:flex;align-items:center;gap:20px">{player_portrait_html}<div><div class="ep-player-kicker">PLAYER PERFORMANCE PROFILE</div>
   <div class="ep-player-name">{player_name_html}</div>
   <div class="ep-player-meta">{team_html} • {latest.get('position','EUROLEAGUE PLAYER') if pd.notna(latest.get('position','EUROLEAGUE PLAYER')) else 'EUROLEAGUE PLAYER'}</div></div></div>
-  <div class="ep-match"><div class="ep-scoreline"><div class="ep-score">—</div><div class="ep-vs">VS</div><div class="ep-score">—</div></div>
+  <div class="ep-match"><div class="ep-scoreline"><div class="ep-score">{score_left_html}</div><div class="ep-vs">VS</div><div class="ep-score">{score_right_html}</div></div>
   <div class="ep-teams"><span>{team_html}</span><span>{opp_html}</span></div>
-  <div class="ep-date">◷ Poslednji evidentirani nastup: {date_text}</div></div>
+  <div class="ep-date">◷ Poslednji evidentirani nastup: {date_text}</div>
+  {'' if score_left != 'N/A' else '<div class="ep-date">Rezultat nije dostupan u izvoru podataka</div>'}</div>
 </div>
 """, unsafe_allow_html=True)
 stat_values = [
