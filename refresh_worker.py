@@ -1,3 +1,163 @@
+"""EURO PICKS free basketball ingestion worker.
+
+Uses SportAPI.ai Free key. Polls yesterday/today/tomorrow/+2 days and ingests
+box scores for finished games when the provider exposes them. Never fabricates
+missing data.
+"""
+import logging
+import os
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+
+import requests
+from supabase import create_client
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+
+API_KEY = os.environ.get("SPORTAPI_KEY")
+SB_URL = os.environ.get("SUPABASE_URL")
+SB_SERVICE = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+
+if not all([API_KEY, SB_URL, SB_SERVICE]):
+    raise SystemExit(
+        "Missing SPORTAPI_KEY, SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY environment variable"
+    )
+
+API = "https://sportapi.ai/api/basketball"
+HEADERS = {"X-Api-Key": API_KEY}
+sb = create_client(SB_URL, SB_SERVICE)
+
+
+def get(path, params=None, attempts=3):
+    """GET with retries for temporary network/provider errors."""
+    url = API + path
+    for attempt in range(1, attempts + 1):
+        try:
+            response = requests.get(
+                url,
+                headers=HEADERS,
+                params=params,
+                timeout=(10, 60),
+            )
+            if response.status_code == 429:
+                logging.warning("SportAPI rate limit reached; stopping this run")
+                raise RuntimeError("rate_limited")
+            if response.status_code >= 500 and attempt < attempts:
+                logging.warning(
+                    "SportAPI returned HTTP %s for %s (attempt %s/%s); retrying",
+                    response.status_code, path, attempt, attempts,
+                )
+                time.sleep(2 ** attempt)
+                continue
+            response.raise_for_status()
+            data = response.json()
+            if data.get("success") is False:
+                raise RuntimeError(data.get("error") or "SportAPI returned success=false")
+            return data
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            if attempt >= attempts:
+                raise
+            logging.warning(
+                "Temporary SportAPI connection problem for %s (attempt %s/%s): %s",
+                path, attempt, attempts, exc,
+            )
+            time.sleep(2 ** attempt)
+    raise RuntimeError(f"SportAPI request failed after {attempts} attempts: {path}")
+
+
+def _conflict_columns(conflict):
+    return [part.strip() for part in conflict.split(",")]
+
+
+def deduplicate_rows(rows, conflict):
+    """Remove duplicate conflict keys before sending a PostgREST upsert.
+
+    Postgres rejects one INSERT ... ON CONFLICT statement if the same target
+    row appears more than once. Merge duplicate rows, preferring later
+    non-null values while retaining earlier values when later data is null.
+    """
+    columns = _conflict_columns(conflict)
+    unique = {}
+    for row in rows or []:
+        key = tuple(row.get(column) for column in columns)
+        if any(value is None for value in key):
+            logging.warning(
+                "Skipping row with missing conflict key %s: %s",
+                columns, row,
+            )
+            continue
+        if key not in unique:
+            unique[key] = dict(row)
+        else:
+            for field, value in row.items():
+                if value is not None:
+                    unique[key][field] = value
+    removed = len(rows or []) - len(unique)
+    if removed:
+        logging.info(
+            "Removed/merged %d duplicate rows for conflict key %s",
+            removed, conflict,
+        )
+    return list(unique.values())
+
+
+def upsert(table, rows, conflict):
+    if not rows:
+        return
+    clean_rows = deduplicate_rows(rows, conflict)
+    if clean_rows:
+        logging.info(
+            "Upserting %d rows into %s (received %d before deduplication)",
+            len(clean_rows), table, len(rows),
+        )
+        sb.table(table).upsert(clean_rows, on_conflict=conflict).execute()
+
+
+def main():
+    leagues_data = get("/leagues").get("data", [])
+    logging.info("Provider reports %d basketball competitions", len(leagues_data))
+
+    today = datetime.now(timezone.utc).date()
+    dates = [(today + timedelta(days=offset)).isoformat() for offset in (-1, 0, 1, 2)]
+
+    games_by_id = {}
+    for day in dates:
+        payload = get(f"/games/date/{day}", {"tz": "Europe/Belgrade"})
+        for game in payload.get("data", []) or []:
+            if game.get("id") is not None:
+                games_by_id[str(game["id"])] = game
+
+    leagues_by_id = {
+        str(league.get("id")): league
+        for league in leagues_data
+        if league.get("id") is not None
+    }
+
+    comp_rows = []
+    season_rows = []
+    team_rows = []
+    game_rows = []
+
+    for league in leagues_data:
+        if league.get("id") is None:
+            continue
+        competition_id = f"sportapi:competition:{league['id']}"
+        comp_rows.append({
+            "id": competition_id,
+            "name": league.get("name") or league.get("slug"),
+            "country": league.get("country"),
+            "gender": league.get("gender"),
+            "level": league.get("type"),
+            "source": "sportapi",
+            "source_competition_id": str(league["id"]),
+            "active": True,
+        })
+
+        season = league.get("current_season")
         if season:
             season_rows.append({
                 "id": f"sportapi:season:{league['id']}:{season}",
