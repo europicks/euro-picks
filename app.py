@@ -13,6 +13,21 @@ from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
 
+def format_serbian_date(value, include_time=False):
+    """Format dates consistently for the EURO PICKS interface."""
+    if value is None or pd.isna(value):
+        return "—"
+    try:
+        dt = pd.to_datetime(value, errors="coerce")
+        if pd.isna(dt):
+            return "—"
+        if getattr(dt, "tzinfo", None) is not None:
+            dt = dt.tz_convert("Europe/Belgrade")
+        return dt.strftime("%d. %m. %Y. %H:%M" if include_time else "%d. %m. %Y.")
+    except (TypeError, ValueError, OverflowError):
+        return "—"
+
+
 def get_supabase():
     try:
         url = st.secrets["SUPABASE_URL"]
@@ -387,7 +402,7 @@ def show_upcoming_database_games():
                 parsed_start = datetime.fromisoformat(str(raw_start).replace("Z", "+00:00"))
                 if parsed_start.tzinfo is None:
                     parsed_start = parsed_start.replace(tzinfo=timezone.utc)
-                display_start = parsed_start.astimezone(belgrade_tz).strftime("%d. %m. %Y %H:%M")
+                display_start = parsed_start.astimezone(belgrade_tz).strftime("%d. %m. %Y. %H:%M")
             except (TypeError, ValueError):
                 display_start = raw_start or "—"
             rows.append({
@@ -565,7 +580,7 @@ with tabs[0]:
 
 with tabs[1]:
     show = player_df.head(20).copy()
-    show["Datum"] = show["date"].dt.strftime("%d.%m.%Y")
+    show["Datum"] = show["date"].map(format_serbian_date)
     show["Min"] = show["min"].round(1)
     st.dataframe(show[["Datum","team","opponent","venue","Min","pts","reb","ast","3pm","3pa","stl","tov","blk","pir"]]
                  .rename(columns={"team":"Tim","opponent":"Protivnik","venue":"Lokacija","pts":"PTS",
@@ -583,7 +598,9 @@ with tabs[2]:
     selected_opp = st.selectbox("Detaljna istorija protiv tima", opp_options)
     vs = player_df[player_df["opponent"] == selected_opp]
     st.write(f"**{chosen_player} protiv {selected_opp}:** {len(vs)} utakmica")
-    st.dataframe(vs[["date","pts","reb","ast","3pm","pir","min"]].rename(
+    vs_display = vs[["date","pts","reb","ast","3pm","pir","min"]].copy()
+    vs_display["date"] = vs_display["date"].map(format_serbian_date)
+    st.dataframe(vs_display.rename(
         columns={"date":"Datum","pts":"PTS","reb":"REB","ast":"AST","3pm":"3PM","pir":"PIR","min":"Min"}),
         use_container_width=True, hide_index=True)
 
@@ -791,7 +808,9 @@ x1.metric("OVER – prebacio", f"{over_count}/{n}", f"{100*over_count/max(1,n):.
 x2.metric("UNDER – nije prebacio", f"{under_count}/{n}", f"{100*under_count/max(1,n):.0f}%")
 x3.metric("Tačno na granici", pushes)
 st.write(f"Prosek u uzorku: **{avg(sample, prop_col):.2f}** | Medijana: **{safe_num(sample[prop_col]).median():.1f}**")
-st.dataframe(sample[["date", "opponent", prop_col]].rename(columns={"date":"Datum", "opponent":"Protivnik", prop_col:prop_label}), use_container_width=True, hide_index=True)
+sample_display = sample[["date", "opponent", prop_col]].copy()
+sample_display["date"] = sample_display["date"].map(format_serbian_date)
+st.dataframe(sample_display.rename(columns={"date":"Datum", "opponent":"Protivnik", prop_col:prop_label}), use_container_width=True, hide_index=True)
 
 # Visual summary inspired by the supplied EURO PICKS reference.
 best_side = "OVER" if over_count > under_count else "UNDER" if under_count > over_count else "NEUTRAL"
