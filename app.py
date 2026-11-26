@@ -4,6 +4,8 @@ import plotly.express as px
 import requests
 from io import BytesIO
 import html
+import re
+import unicodedata
 
 st.set_page_config(page_title="EURO PICKS", page_icon="🏀", layout="wide")
 
@@ -281,6 +283,13 @@ background:#101114;border:1px solid #30343a;border-radius:24px;padding:28px 30px
 .ep-player-kicker{font-size:11px;letter-spacing:2px;color:#8faedb;font-weight:800}
 .ep-player-name{font-size:clamp(30px,5vw,54px);line-height:.98;font-weight:1000;font-style:italic;letter-spacing:-1.5px;color:#fff;margin:10px 0}
 .ep-player-meta{font-size:15px;color:#b8c9e4}
+.ep-hero-portrait{width:112px;height:112px;object-fit:cover;border-radius:18px;border:2px solid #27dc92;box-shadow:0 0 22px #27dc9233}
+.ep-hero-portrait-fallback{width:112px;height:112px;display:flex;align-items:center;justify-content:center;border-radius:18px;background:#20334b;border:2px solid #385475;font-size:46px}
+.ep-player-directory{display:grid;grid-template-columns:repeat(auto-fill,minmax(145px,1fr));gap:10px}
+.ep-player-card{display:flex;align-items:center;gap:10px;min-width:0;background:#101b2e;border:1px solid #29415f;border-radius:12px;padding:8px;color:#edf4ff;font-size:12px;font-weight:700}
+.ep-player-card img,.ep-avatar-fallback{width:42px;height:42px;min-width:42px;border-radius:50%;object-fit:cover;background:#20334b;border:1px solid #385475}
+.ep-avatar-fallback{display:flex;align-items:center;justify-content:center;font-size:21px}
+.ep-player-card span{overflow-wrap:anywhere}
 .ep-match{text-align:center;border-left:1px solid #29436e;padding:8px 0 8px 20px}
 .ep-scoreline{display:flex;align-items:center;justify-content:center;gap:16px}
 .ep-score{width:70px;height:70px;border:2px solid #47618d;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:25px;font-weight:900;color:white}
@@ -361,6 +370,47 @@ def avg(df, col):
 
 def fmt(x):
     return f"{x:.1f}"
+
+
+
+
+def normalize_player_name(value):
+    """Normalize names so the 675 Hoops list can match official EuroLeague profiles."""
+    value = unicodedata.normalize("NFKD", str(value or ""))
+    value = "".join(ch for ch in value if not unicodedata.combining(ch))
+    return re.sub(r"[^a-z0-9]", "", value.lower())
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_euroleague_player_images(season_code):
+    """Load official EuroLeague player portrait URLs; image lookup is cached for 24h."""
+    url = f"https://api-live.euroleague.net/v2/competitions/E/seasons/{season_code}/people"
+    response = requests.get(url, timeout=20, headers={"User-Agent": "EURO-PICKS/1.0"})
+    response.raise_for_status()
+    payload = response.json()
+    rows = payload.get("data", payload) if isinstance(payload, dict) else payload
+    if isinstance(rows, dict):
+        for key in ("items", "people", "results", "data"):
+            if isinstance(rows.get(key), list):
+                rows = rows[key]
+                break
+    if not isinstance(rows, list):
+        return {}
+    image_map = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = row.get("player_name") or row.get("name") or row.get("person_name")
+        image_url = row.get("player_image_url") or row.get("image_url") or row.get("photoUrl")
+        if name and isinstance(image_url, str) and image_url.startswith("https://"):
+            image_map[normalize_player_name(name)] = image_url
+    return image_map
+
+
+def selected_season_code(season_label):
+    match = re.search(r"(20\d{2})", str(season_label or ""))
+    year = match.group(1) if match else str(datetime.now(ZoneInfo("Europe/Belgrade")).year)
+    return f"E{year}"
 
 
 def fetch_db_player_offers(player_name):
@@ -503,6 +553,28 @@ with st.sidebar:
     chosen_player = st.selectbox("Igrač", players)
     venue_filter = st.selectbox("Domaćin/gost", ["Sve", "home", "away", "neutral"])
 
+# Official portraits are retrieved separately from SportAPI and cached for 24 hours.
+image_season = chosen_season if chosen_season != "Sve sezone" else (seasons[0] if seasons else None)
+player_image_map = {}
+try:
+    if image_season:
+        player_image_map = load_euroleague_player_images(selected_season_code(image_season))
+except Exception as image_error:
+    st.caption("Fotografije igrača trenutno nisu dostupne; statistika i analiza rade normalno.")
+
+# Player directory: each filtered player is shown beside their official portrait.
+with st.expander("📸 Igrači i fotografije", expanded=False):
+    directory_rows = []
+    for player_name in players:
+        portrait = player_image_map.get(normalize_player_name(player_name))
+        safe_name = html.escape(str(player_name))
+        if portrait:
+            visual = f'<img src="{html.escape(portrait, quote=True)}" alt="{safe_name}" loading="lazy">'
+        else:
+            visual = '<div class="ep-avatar-fallback">👤</div>'
+        directory_rows.append(f'<div class="ep-player-card">{visual}<span>{safe_name}</span></div>')
+    st.markdown('<div class="ep-player-directory">' + ''.join(directory_rows) + '</div>', unsafe_allow_html=True)
+
 player_df = team_df[team_df["player"] == chosen_player].copy()
 if venue_filter != "Sve":
     player_df = player_df[player_df["venue"].str.lower() == venue_filter]
@@ -518,14 +590,19 @@ last5 = player_df.head(5)
 last10 = player_df.head(10)
 season_stats = player_df
 player_name_html = html.escape(str(chosen_player))
+player_portrait = player_image_map.get(normalize_player_name(chosen_player))
+player_portrait_html = (
+    f'<img class="ep-hero-portrait" src="{html.escape(player_portrait, quote=True)}" alt="{player_name_html}">'
+    if player_portrait else '<div class="ep-hero-portrait-fallback">👤</div>'
+)
 team_html = html.escape(str(latest["team"]))
 opp_html = html.escape(str(latest["opponent"]))
 date_text = latest["date"].strftime("%d.%m.%Y") if pd.notna(latest["date"]) else "Datum nije dostupan"
 st.markdown(f"""
 <div class="ep-hero">
-  <div><div class="ep-player-kicker">PLAYER PERFORMANCE PROFILE</div>
+  <div style="display:flex;align-items:center;gap:20px">{player_portrait_html}<div><div class="ep-player-kicker">PLAYER PERFORMANCE PROFILE</div>
   <div class="ep-player-name">{player_name_html}</div>
-  <div class="ep-player-meta">{team_html} • {latest.get('position','EUROLEAGUE PLAYER') if pd.notna(latest.get('position','EUROLEAGUE PLAYER')) else 'EUROLEAGUE PLAYER'}</div></div>
+  <div class="ep-player-meta">{team_html} • {latest.get('position','EUROLEAGUE PLAYER') if pd.notna(latest.get('position','EUROLEAGUE PLAYER')) else 'EUROLEAGUE PLAYER'}</div></div></div>
   <div class="ep-match"><div class="ep-scoreline"><div class="ep-score">—</div><div class="ep-vs">VS</div><div class="ep-score">—</div></div>
   <div class="ep-teams"><span>{team_html}</span><span>{opp_html}</span></div>
   <div class="ep-date">◷ Poslednji evidentirani nastup: {date_text}</div></div>
