@@ -3,12 +3,14 @@ import pandas as pd
 import plotly.express as px
 import requests
 from io import BytesIO
+import html
 
 st.set_page_config(page_title="EURO PICKS", page_icon="🏀", layout="wide")
 
 # --- EURO PICKS access control (Supabase Auth + database-backed Premium) ---
 from supabase import create_client
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 
 def get_supabase():
@@ -227,13 +229,14 @@ if not is_admin and not is_premium:
 
 st.markdown("""
 <style>
-.stApp {background: radial-gradient(circle at 12% 0%, #14233d 0%, #080d18 48%, #070b13 100%); color:#eef4ff}
-[data-testid="stHeader"] {background:rgba(7,11,19,.92)}
-[data-testid="stSidebar"] {background:#0d1728; border-right:1px solid #20334e}
+ .stApp {background:radial-gradient(ellipse at 50% 0%,#a5f4ff 0%,#43d9f3 34%,#168dcf 68%,#0871b6 100%);color:#f5f7fa}
+[data-testid="stAppViewContainer"]{background:transparent}
+[data-testid="stHeader"] {background:rgba(5,12,20,.20)}
+[data-testid="stSidebar"] {background:#080b10; border-right:1px solid #26323d}
 [data-testid="stSidebar"] * {color:#e8f0ff !important}
 .stApp h1,.stApp h2,.stApp h3,.stApp h4 {color:#f4f8ff !important}
 .stApp p,.stApp label,.stApp [data-testid="stCaptionContainer"] {color:#b7c6dc}
-div[data-testid="stMetric"] {background:linear-gradient(145deg,#14243b,#101b2e);padding:16px;border-radius:14px;border:1px solid #263d5b;box-shadow:0 5px 18px rgba(0,0,0,.22)}
+div[data-testid="stMetric"] {background:#101114;padding:16px;border-radius:15px;border:1px solid #30343a;box-shadow:0 5px 18px rgba(0,0,0,.22)}
 div[data-testid="stMetric"] label {color:#9fb4cf !important}
 div[data-testid="stMetric"] [data-testid="stMetricValue"] {color:#f4f8ff !important}
 div[data-testid="stMetric"] [data-testid="stMetricDelta"] {color:#31e69a !important;background:#123b34;border-radius:999px;padding:3px 8px}
@@ -246,11 +249,60 @@ div[data-testid="stMetric"] [data-testid="stMetricDelta"] {color:#31e69a !import
 .stAlert {background:#122139;border:1px solid #29415f;color:#eaf2ff}
 button[kind="primary"] {background:#20d995 !important;color:#07130f !important;border:0}
 hr {border-color:#263d5b}
+
+/* EURO PICKS visual identity */
+.block-container {max-width: 1440px; padding-top: 1.1rem; padding-bottom: 3rem;}
+ .ep-topbar {display:grid;grid-template-columns:1fr 1.5fr 1fr;align-items:center;gap:12px;
+background:linear-gradient(110deg,#07131d,#102a3b 55%,#07131d);border:1px solid #263b4b;
+border-radius:20px;padding:17px 24px;margin:0 0 22px;box-shadow:0 12px 35px #0006}
+.ep-league {font-size:13px;line-height:1.25;font-weight:900;letter-spacing:.8px;color:#eaf1ff;border-right:1px solid #29436e}
+.ep-brand{text-align:center;font-size:clamp(25px,4vw,43px);font-weight:1000;font-style:italic;letter-spacing:-1.8px;color:#fff;line-height:1}
+.ep-brand span{color:#21dc91}
+.ep-brand small{display:block;font-size:9px;letter-spacing:3px;color:#9fb3d1;font-style:normal;margin-top:7px}
+.ep-live{justify-self:end;border:1px solid #285c5a;border-radius:30px;padding:9px 15px;color:#eaf6ff;font-size:12px;font-weight:800}
+.ep-live i{display:inline-block;width:9px;height:9px;background:#27e39b;border-radius:50%;margin-right:8px;box-shadow:0 0 12px #27e39b}
+ .ep-hero{display:grid;grid-template-columns:1.25fr .9fr;gap:20px;align-items:center;
+background:#101114;border:1px solid #30343a;border-radius:24px;padding:28px 30px;margin:10px 0 18px;min-height:190px;box-shadow:0 18px 45px #001c2d55}
+.ep-player-kicker{font-size:11px;letter-spacing:2px;color:#8faedb;font-weight:800}
+.ep-player-name{font-size:clamp(30px,5vw,54px);line-height:.98;font-weight:1000;font-style:italic;letter-spacing:-1.5px;color:#fff;margin:10px 0}
+.ep-player-meta{font-size:15px;color:#b8c9e4}
+.ep-match{text-align:center;border-left:1px solid #29436e;padding:8px 0 8px 20px}
+.ep-scoreline{display:flex;align-items:center;justify-content:center;gap:16px}
+.ep-score{width:70px;height:70px;border:2px solid #47618d;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:25px;font-weight:900;color:white}
+.ep-vs{color:#9bb1d2;font-weight:900}
+.ep-teams{display:flex;justify-content:center;gap:20px;margin-top:10px;font-size:12px;font-weight:900;color:#eaf1ff}
+.ep-date{margin-top:12px;color:#b8c9e4;font-size:13px}
+.ep-stat-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px;margin:0 0 18px}
+ .ep-stat{background:#101114;border:1px solid #30343a;border-radius:15px;padding:13px 8px;text-align:center}
+.ep-stat-label{font-size:12px;color:#a9bbd5;font-weight:700}
+.ep-stat-value{font-size:27px;color:#fff;font-weight:950;margin-top:2px}
+.ep-stat.primary{border:1.5px solid #28dc98;box-shadow:0 0 15px #1edc8c22}
+ .ep-panel{background:#101114;border:1px solid #30343a;border-radius:17px;padding:17px 19px}
+.ep-panel-title{font-size:15px;font-weight:900;color:#f4f8ff;letter-spacing:.3px;margin-bottom:12px}
+.ep-panel-title span{color:#28dc98;margin-right:8px}
+.ep-insight{padding:9px 0;border-bottom:1px solid #263650;color:#c8d5e8;font-size:13px}
+.ep-insight:last-child{border-bottom:0}
+.ep-pick{display:grid;grid-template-columns:1fr auto;align-items:center;gap:20px;
+background:linear-gradient(110deg,#102a5d,#0b1a3b 65%,#09152c);border:1px solid #31538d;
+border-radius:20px;padding:22px 28px;margin:22px 0}
+.ep-pick-label{color:#a9c1e7;font-size:11px;letter-spacing:2px;font-weight:900}
+.ep-pick-main{font-size:clamp(26px,4vw,42px);font-weight:1000;font-style:italic;color:#fff;line-height:1.1}
+.ep-pick-side{text-align:center;border-left:1px solid #35517f;padding-left:24px}
+.ep-pick-pct{font-size:42px;font-weight:1000;color:#27dc92;line-height:1}
+.ep-muted{color:#9db0cd;font-size:12px}
+@media(max-width:700px){.ep-topbar{grid-template-columns:1fr;text-align:center}.ep-league{border:0}.ep-live{justify-self:center}.ep-hero{grid-template-columns:1fr;padding:20px}.ep-match{border-left:0;border-top:1px solid #29436e;padding:18px 0 0}.ep-stat-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.ep-pick{grid-template-columns:1fr}.ep-pick-side{border-left:0;border-top:1px solid #35517f;padding:15px 0 0}}
+
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🏀 EURO PICKS")
-st.caption("EUROPE + GLOBAL BASKETBALL ANALYTICS • trenutno aktivan verifikovan izvor: EuroLeague")
+st.markdown("""
+<div class="ep-topbar">
+  <div class="ep-league">TURKISH AIRLINES<br>EUROLEAGUE</div>
+  <div class="ep-brand"><div>EURO <span>PICKS</span></div><small>ANALYTICS &amp; BETTING INSIGHTS</small></div>
+  <div class="ep-live"><i></i> LIVE DATA</div>
+</div>
+""", unsafe_allow_html=True)
+st.caption("EUROLEAGUE ANALYTICS • Podaci se prikazuju prema poslednjem dostupnom ažuriranju izvora.")
 
 YEARS = list(range(2026, 2006, -1))
 BASE = "https://675hoops.com/downloads/player_box-{}.csv.gz"
@@ -328,9 +380,18 @@ def show_upcoming_database_games():
         teams = sb.table("teams").select("id,name").in_("id", team_ids).execute().data or [] if team_ids else []
         team_map = {t["id"]: t["name"] for t in teams}
         rows = []
+        belgrade_tz = ZoneInfo("Europe/Belgrade")
         for g in games:
+            raw_start = g.get("start_time")
+            try:
+                parsed_start = datetime.fromisoformat(str(raw_start).replace("Z", "+00:00"))
+                if parsed_start.tzinfo is None:
+                    parsed_start = parsed_start.replace(tzinfo=timezone.utc)
+                display_start = parsed_start.astimezone(belgrade_tz).strftime("%d. %m. %Y %H:%M")
+            except (TypeError, ValueError):
+                display_start = raw_start or "—"
             rows.append({
-                "Početak": g.get("start_time"),
+                "Početak": display_start,
                 "Domaćin": team_map.get(g.get("home_team_id"), g.get("home_team_id")),
                 "Gost": team_map.get(g.get("away_team_id"), g.get("away_team_id")),
                 "Status": g.get("status") or "scheduled",
@@ -345,7 +406,7 @@ show_upcoming_database_games()
 
 refresh_col1, refresh_col2 = st.columns([3, 1])
 with refresh_col1:
-    st.caption("Aplikacija proverava izvor na svakih 15 minuta dok se koristi. Novi podaci se pojavljuju tek kada ih izvor objavi.")
+    st.caption("Ažuriranje podataka")
 with refresh_col2:
     if st.button("🔄 Osveži podatke sada", use_container_width=True):
         st.cache_data.clear()
@@ -408,7 +469,7 @@ if not team_data.empty:
     team_data = team_data.dropna(subset=["date", "team", "opponent"])
 
 st.success(f"Podaci učitani: {len(all_data):,} nastupa • {all_data['player'].nunique():,} igrača • {all_data['season_label'].nunique()} sezona")
-st.caption("Provera izvora: na 15 minuta dok se aplikacija koristi. Izvor 6.75 objavljuje dnevne skupove podataka, pa završni box score ne mora biti dostupan odmah po završetku utakmice.")
+
 
 with st.sidebar:
     st.header("🔎 Filteri")
@@ -437,18 +498,33 @@ if player_df.empty:
     st.stop()
 
 latest = player_df.iloc[0]
-st.subheader(f"{chosen_player}")
-st.caption(f"Tim u izabranom filteru: {latest['team']} • Poslednja utakmica: {latest['date'].date()} • Protiv: {latest['opponent']}")
-
 # Season/filtered averages and recent form
 last5 = player_df.head(5)
 last10 = player_df.head(10)
 season_stats = player_df
-
-metric_cols = st.columns(5)
-for col, label, key in zip(metric_cols, ["PTS", "REB", "AST", "3PM", "PIR"],
-                           ["pts", "reb", "ast", "3pm", "pir"]):
-    col.metric(label, fmt(avg(season_stats, key)), f"L5 {fmt(avg(last5,key))} | L10 {fmt(avg(last10,key))}")
+player_name_html = html.escape(str(chosen_player))
+team_html = html.escape(str(latest["team"]))
+opp_html = html.escape(str(latest["opponent"]))
+date_text = latest["date"].strftime("%d.%m.%Y") if pd.notna(latest["date"]) else "Datum nije dostupan"
+st.markdown(f"""
+<div class="ep-hero">
+  <div><div class="ep-player-kicker">PLAYER PERFORMANCE PROFILE</div>
+  <div class="ep-player-name">{player_name_html}</div>
+  <div class="ep-player-meta">{team_html} • {latest.get('position','EUROLEAGUE PLAYER') if pd.notna(latest.get('position','EUROLEAGUE PLAYER')) else 'EUROLEAGUE PLAYER'}</div></div>
+  <div class="ep-match"><div class="ep-scoreline"><div class="ep-score">—</div><div class="ep-vs">VS</div><div class="ep-score">—</div></div>
+  <div class="ep-teams"><span>{team_html}</span><span>{opp_html}</span></div>
+  <div class="ep-date">◷ Poslednji evidentirani nastup: {date_text}</div></div>
+</div>
+""", unsafe_allow_html=True)
+stat_values = [
+    ("PPG", fmt(avg(season_stats, "pts")), True),
+    ("RPG", fmt(avg(season_stats, "reb")), False),
+    ("APG", fmt(avg(season_stats, "ast")), False),
+    ("UTAKMICE", str(len(player_df)), False),
+    ("3PM", fmt(avg(season_stats, "3pm")), False),
+]
+stats_html = "".join(f'<div class="ep-stat {"primary" if primary else ""}"><div class="ep-stat-label">{label}</div><div class="ep-stat-value">{value}</div></div>' for label,value,primary in stat_values)
+st.markdown(f'<div class="ep-stat-grid">{stats_html}</div>', unsafe_allow_html=True)
 
 st.markdown("### 📊 Forma igrača")
 a, b, c, d = st.columns(4)
@@ -463,10 +539,21 @@ with tabs[0]:
     chart_stat = st.selectbox("Statistika za grafikon", ["Poeni", "Skokovi", "Asistencije", "Trojke", "PIR"], key="chart_stat")
     stat_map = {"Poeni":"pts", "Skokovi":"reb", "Asistencije":"ast", "Trojke":"3pm", "PIR":"pir"}
     chart_df = player_df.sort_values("date").copy()
-    fig = px.line(chart_df, x="date", y=stat_map[chart_stat], markers=True,
-                  title=f"{chosen_player} – {chart_stat} po utakmicama",
-                  hover_data=["opponent", "team", "min"])
-    fig.update_layout(template="plotly_dark", paper_bgcolor="#0b1020", plot_bgcolor="#0b1020")
+    chart_recent = chart_df.tail(10).copy()
+    chart_recent["date_label"] = chart_recent["date"].dt.strftime("%d.%m")
+    metric_col = stat_map[chart_stat]
+    chart_recent["bar_color"] = chart_recent[metric_col].apply(lambda v: "#21d68b" if v >= chart_recent[metric_col].mean() else "#f20d1b")
+    fig = px.bar(chart_recent, x="date_label", y=metric_col,
+                 title=f"{chosen_player} – {chart_stat.upper()} • POSLEDNJIH 10 UTAKMICA",
+                 hover_data=["opponent", "team", "min"], color="bar_color",
+                 color_discrete_map={"#21d68b":"#21d68b", "#f20d1b":"#f20d1b"})
+    fig.update_traces(marker_line_width=0, text=chart_recent[metric_col], textposition="outside")
+    threshold = float(chart_recent[metric_col].mean()) if len(chart_recent) else 0
+    fig.add_hline(y=threshold, line_color="#f3f3f3", line_width=1.5,
+                  annotation_text=f"Prosek {threshold:.1f}", annotation_position="top left")
+    fig.update_layout(template="plotly_dark", paper_bgcolor="#101114", plot_bgcolor="#101114",
+                      font_color="#eaf1ff", showlegend=False, margin=dict(l=10,r=10,t=55,b=10),
+                      xaxis_title="Datum", yaxis_title=chart_stat)
     st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("#### Prosek po lokaciji")
@@ -670,7 +757,20 @@ with tabs[3]:
 
 
 
-st.caption("Istorijski rezultati se porede sa svakom pojedinačnom linijom.")
+st.markdown("### 📈 Granice kladionica za ovog igrača")
+db_offers, offers_error = fetch_db_player_offers(chosen_player)
+if offers_error:
+    st.info(offers_error)
+elif not db_offers.empty:
+    st.markdown("#### Aktuelne ponude sačuvane u EURO PICKS bazi")
+    db_offers = db_offers.rename(columns={
+        "market":"Tržište", "line":"Granica", "bookmaker":"Kladionica",
+        "over_odds":"OVER kvota", "under_odds":"UNDER kvota",
+        "captured_at":"Vreme preuzimanja", "game_id":"ID utakmice", "source":"Izvor"
+    })
+    st.dataframe(db_offers, use_container_width=True, hide_index=True)
+# No empty bookmaker-offer message is shown when there are no current offers.
+st.caption("Istorijska analiza učinka")
 prop_label = st.selectbox("Statistika za poređenje", ["Poeni", "Skokovi", "Asistencije", "Trojke", "PIR", "PTS + REB", "PTS + AST", "REB + AST", "PRA"])
 combo_cols = {"PTS + REB": ("pts", "reb"), "PTS + AST": ("pts", "ast"), "REB + AST": ("reb", "ast"), "PRA": ("pts", "reb", "ast")}
 if prop_label in combo_cols:
@@ -692,6 +792,32 @@ x2.metric("UNDER – nije prebacio", f"{under_count}/{n}", f"{100*under_count/ma
 x3.metric("Tačno na granici", pushes)
 st.write(f"Prosek u uzorku: **{avg(sample, prop_col):.2f}** | Medijana: **{safe_num(sample[prop_col]).median():.1f}**")
 st.dataframe(sample[["date", "opponent", prop_col]].rename(columns={"date":"Datum", "opponent":"Protivnik", prop_col:prop_label}), use_container_width=True, hide_index=True)
+
+# Visual summary inspired by the supplied EURO PICKS reference.
+best_side = "OVER" if over_count > under_count else "UNDER" if under_count > over_count else "NEUTRAL"
+best_rate = max(over_count, under_count) / max(1, n) * 100
+best_count = max(over_count, under_count)
+best_line_label = "OVER" if best_side == "OVER" else "UNDER"
+insight_lines = [
+    f"{best_count} od {n} nastupa je na strani {best_side.lower()} granice {line:g}.",
+    f"Prosek u uzorku iznosi {avg(sample, prop_col):.1f}, a medijana {safe_num(sample[prop_col]).median():.1f}.",
+    f"Tačno na granici: {pushes} nastupa."
+]
+insights_html = "".join(f'<div class="ep-insight">✓ &nbsp;{html.escape(x)}</div>' for x in insight_lines)
+st.markdown(f"""
+<div class="ep-panel" style="margin-top:18px">
+  <div class="ep-panel-title"><span>✦</span> KEY INSIGHTS</div>
+  {insights_html}
+</div>
+<div class="ep-pick">
+  <div><div class="ep-pick-label">{html.escape(prop_label.upper())} • ISTORIJSKI UČINAK</div>
+  <div class="ep-pick-main">{html.escape(str(chosen_player).upper())} – {line:g} {html.escape(prop_label.upper())}</div>
+  <div class="ep-pick-main" style="color:#25df95;font-size:clamp(32px,5vw,58px)">{best_line_label}</div>
+  <div class="ep-muted">Statistički pregled uzorka, nije garancija ishoda niti automatska opklada.</div></div>
+  <div class="ep-pick-side"><div class="ep-muted">PROLAZ • {html.escape(sample_choice.upper())}</div>
+  <div class="ep-pick-pct">{best_rate:.0f}%</div><div class="ep-muted">{best_count}/{n} utakmica</div></div>
+</div>
+""", unsafe_allow_html=True)
 
 
 st.markdown("---")
