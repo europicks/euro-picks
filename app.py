@@ -383,27 +383,99 @@ def normalize_player_name(value):
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def load_euroleague_player_images(season_code):
-    """Load official EuroLeague player portrait URLs; image lookup is cached for 24h."""
-    url = f"https://api-live.euroleague.net/v2/competitions/E/seasons/{season_code}/people"
-    response = requests.get(url, timeout=20, headers={"User-Agent": "EURO-PICKS/1.0"})
-    response.raise_for_status()
-    payload = response.json()
-    rows = payload.get("data", payload) if isinstance(payload, dict) else payload
-    if isinstance(rows, dict):
-        for key in ("items", "people", "results", "data"):
-            if isinstance(rows.get(key), list):
-                rows = rows[key]
-                break
-    if not isinstance(rows, list):
-        return {}
+    """Load official EuroLeague portraits. Current-season roster data is fetched per club
+    because the season-wide people endpoint can return an empty list during an active season.
+    Results are cached for 24 hours and do not use the SportAPI quota.
+    """
+    base = "https://feeds.incrowdsports.com/provider/euroleague-feeds/v2"
+    headers = {"User-Agent": "Mozilla/5.0 EURO-PICKS/1.0", "Accept": "application/json"}
+
+    def get_json(url):
+        response = requests.get(url, timeout=20, headers=headers)
+        response.raise_for_status()
+        return response.json()
+
+    def rows_from(payload):
+        if isinstance(payload, list):
+            return payload
+        if isinstance(payload, dict):
+            for key in ("data", "items", "people", "results"):
+                if isinstance(payload.get(key), list):
+                    return payload[key]
+        return []
+
+    def walk(obj):
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                yield str(key).lower(), value
+                yield from walk(value)
+        elif isinstance(obj, list):
+            for value in obj:
+                yield from walk(value)
+
+    def extract_name(row):
+        person = row.get("person") if isinstance(row.get("person"), dict) else {}
+        name = (row.get("player_name") or row.get("person_name") or row.get("personName")
+                or row.get("name") or person.get("name") or person.get("personName")
+                or person.get("person_name"))
+        if not name:
+            for key, value in walk(row):
+                if key in ("personname", "playername", "fullname") and isinstance(value, str) and value.strip():
+                    name = value
+                    break
+        if isinstance(name, str) and "," in name:
+            parts = [part.strip() for part in name.split(",", 1)]
+            if len(parts) == 2:
+                name = f"{parts[1]} {parts[0]}"
+        return name.strip() if isinstance(name, str) else None
+
+    def extract_image(row):
+        preferred, other = [], []
+        for key, value in walk(row):
+            if isinstance(value, str) and value.startswith("https://") and any(
+                token in key for token in ("image", "photo", "headshot", "portrait", "picture")
+            ):
+                (preferred if any(token in key for token in ("headshot", "portrait", "player", "profile")) else other).append(value)
+        return (preferred or other or [None])[0]
+
     image_map = {}
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        name = row.get("player_name") or row.get("name") or row.get("person_name")
-        image_url = row.get("player_image_url") or row.get("image_url") or row.get("photoUrl")
-        if name and isinstance(image_url, str) and image_url.startswith("https://"):
-            image_map[normalize_player_name(name)] = image_url
+    # First try the season-wide endpoint (works for many completed seasons).
+    people_url = f"https://api-live.euroleague.net/v2/competitions/E/seasons/{season_code}/people"
+    try:
+        for row in rows_from(get_json(people_url)):
+            if not isinstance(row, dict):
+                continue
+            name = extract_name(row)
+            image_url = row.get("player_image_url") or row.get("image_url") or row.get("photoUrl") or extract_image(row)
+            if name and isinstance(image_url, str) and image_url.startswith("https://"):
+                image_map[normalize_player_name(name)] = image_url
+    except Exception:
+        pass
+
+    # Current-season people can be nested under each club, even when the aggregate is empty.
+    if not image_map:
+        clubs_url = f"{base}/competitions/E/seasons/{season_code}/clubs"
+        clubs_payload = get_json(clubs_url)
+        clubs = rows_from(clubs_payload)
+        for club in clubs:
+            if not isinstance(club, dict):
+                continue
+            club_code = club.get("code") or club.get("club_code") or club.get("clubCode")
+            if not club_code:
+                continue
+            roster_url = f"{base}/competitions/E/seasons/{season_code}/clubs/{club_code}/people"
+            try:
+                for row in rows_from(get_json(roster_url)):
+                    if not isinstance(row, dict):
+                        continue
+                    if row.get("type") not in (None, "J", "PLAYER", "Player"):
+                        continue
+                    name = extract_name(row)
+                    image_url = row.get("player_image_url") or row.get("image_url") or row.get("photoUrl") or extract_image(row)
+                    if name and isinstance(image_url, str) and image_url.startswith("https://"):
+                        image_map[normalize_player_name(name)] = image_url
+            except Exception:
+                continue
     return image_map
 
 
