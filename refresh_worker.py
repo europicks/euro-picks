@@ -106,10 +106,29 @@ def main():
     dates = [(today + timedelta(days=offset)).isoformat() for offset in (-1, 0, 1, 2)]
     games_by_id = {}
     for day in dates:
-        data = get(f"/games/date/{day}", {"tz": "Europe/Belgrade"}).get("data", []) or []
+        # Ask SportAPI to filter by its documented EuroLeague slug instead of
+        # downloading every competition and relying only on league-ID equality.
+        day_payload = get(
+            f"/games/date/{day}",
+            {"tz": "Europe/Belgrade", "league": "euroleague"},
+        )
+        data = day_payload.get("data", []) or []
+        logging.info("SportAPI EuroLeague date %s: %d games returned", day, len(data))
         for game in data:
-            league_id = str(((game.get("league") or {}).get("id")))
-            if league_id in euro_ids and game.get("id") is not None:
+            league = game.get("league") or {}
+            league_id = str(league.get("id"))
+            league_slug = str(league.get("slug") or "").strip().lower()
+            league_name = str(league.get("name") or "").strip().lower()
+            # The endpoint is already filtered by league=euroleague. Keep
+            # records whose metadata identifies EuroLeague, or whose league
+            # object is incomplete; still reject an explicitly different league.
+            explicit_euro = (
+                league_slug == "euroleague"
+                or league_name in {"euroleague", "euro league", "turkish airlines euroleague"}
+                or league_id in euro_ids
+            )
+            explicit_other = bool(league_slug or league_name or league_id != "None") and not explicit_euro
+            if game.get("id") is not None and not explicit_other:
                 games_by_id[str(game["id"])] = game
 
     season_by_league = {str(x.get("id")): x.get("current_season") for x in euro_leagues}
@@ -159,7 +178,7 @@ def main():
     upsert("competition_seasons", season_rows)
     upsert("teams", team_rows)
     upsert("games", game_rows)
-    logging.info("EuroLeague: %d games; %d finished games advertise box scores", len(game_rows), len(finished))
+    logging.info("EuroLeague: %d games found across four dates; %d finished games advertise box scores", len(game_rows), len(finished))
 
     player_rows, box_rows = [], []
     fetched_games = skipped_games = dnp_count = 0
