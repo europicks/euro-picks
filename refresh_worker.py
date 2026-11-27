@@ -106,29 +106,36 @@ def main():
     dates = [(today + timedelta(days=offset)).isoformat() for offset in (-1, 0, 1, 2)]
     games_by_id = {}
     for day in dates:
-        # Ask SportAPI to filter by its documented EuroLeague slug instead of
-        # downloading every competition and relying only on league-ID equality.
-        day_payload = get(
+        # SportAPI supports filtering this endpoint by league slug.
+        # Use the canonical EuroLeague slug so we do not depend on a
+        # potentially inconsistent league ID in the date response.
+        date_payload = get(
             f"/games/date/{day}",
             {"tz": "Europe/Belgrade", "league": "euroleague"},
         )
-        data = day_payload.get("data", []) or []
-        logging.info("SportAPI EuroLeague date %s: %d games returned", day, len(data))
+        data = date_payload.get("data", []) or []
+        logging.info("EuroLeague date %s: API returned %d games", day, len(data))
         for game in data:
+            if game.get("id") is None:
+                continue
             league = game.get("league") or {}
-            league_id = str(league.get("id"))
             league_slug = str(league.get("slug") or "").strip().lower()
             league_name = str(league.get("name") or "").strip().lower()
-            # The endpoint is already filtered by league=euroleague. Keep
-            # records whose metadata identifies EuroLeague, or whose league
-            # object is incomplete; still reject an explicitly different league.
-            explicit_euro = (
-                league_slug == "euroleague"
-                or league_name in {"euroleague", "euro league", "turkish airlines euroleague"}
-                or league_id in euro_ids
+            league_id = str(league.get("id")) if league.get("id") is not None else None
+
+            # Trust the server-side league filter when metadata is partial.
+            # Reject only an explicit different league.
+            explicit_other = (
+                (league_slug and league_slug != "euroleague")
+                or (league_name and league_name not in {
+                    "euroleague", "euro league", "turkish airlines euroleague"
+                })
+                or (league_id and league_id not in euro_ids and league_slug != "euroleague"
+                    and league_name not in {
+                        "euroleague", "euro league", "turkish airlines euroleague"
+                    })
             )
-            explicit_other = bool(league_slug or league_name or league_id != "None") and not explicit_euro
-            if game.get("id") is not None and not explicit_other:
+            if not explicit_other:
                 games_by_id[str(game["id"])] = game
 
     season_by_league = {str(x.get("id")): x.get("current_season") for x in euro_leagues}
