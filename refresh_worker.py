@@ -1,7 +1,8 @@
 """EURO PICKS SportAPI worker: EuroLeague only, low-request polling.
 
-Runs once daily around midnight Belgrade time. Existing player box scores are not fetched again.
-No data is fabricated; unavailable box scores are simply skipped and retried on the next daily run.
+Stores complete per-player shooting splits and DNP rows.
+The v2 marker causes one controlled backfill of recent games after the SQL migration;
+after that, already-ingested games are skipped.
 """
 import logging
 import os
@@ -22,6 +23,8 @@ if not all([API_KEY, SB_URL, SB_SERVICE]):
 
 API = "https://sportapi.ai/api/basketball"
 HEADERS = {"X-Api-Key": API_KEY}
+SOURCE = "sportapi"
+INGESTION_VERSION = "v2_shooting_dnp"
 sb = create_client(SB_URL, SB_SERVICE)
 
 
@@ -72,20 +75,24 @@ def upsert(table, rows, conflict="id"):
 
 
 def is_euroleague(league):
-    """Match the named EuroLeague competition, not other basketball leagues."""
     name = str((league or {}).get("name") or (league or {}).get("slug") or "").strip().lower()
     return name in {"euroleague", "euro league", "turkish airlines euroleague"} or name.startswith("euroleague ")
 
 
-def already_has_boxscore(game_id):
-    """Avoid repeating the expensive per-game players endpoint once rows exist."""
+def already_has_v2_boxscore(game_id):
+    """Skip only after the expanded player rows were successfully ingested."""
     result = (sb.table("player_boxscores").select("player_id")
-              .eq("game_id", f"sportapi:game:{game_id}").limit(1).execute())
+              .eq("game_id", f"sportapi:game:{game_id}")
+              .eq("ingestion_version", INGESTION_VERSION)
+              .limit(1).execute())
     return bool(result.data)
 
 
+def as_number(value):
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
 def main():
-    # One competitions request per daily run; only EuroLeague is ingested.
     leagues = get("/leagues").get("data", []) or []
     euro_leagues = [league for league in leagues if is_euroleague(league)]
     euro_ids = {str(league.get("id")) for league in euro_leagues if league.get("id") is not None}
@@ -98,7 +105,6 @@ def main():
     today = datetime.now(ZoneInfo("Europe/Belgrade")).date()
     dates = [(today + timedelta(days=offset)).isoformat() for offset in (-1, 0, 1, 2)]
     games_by_id = {}
-    # Four date requests per daily run, shared endpoint filtered locally to EuroLeague.
     for day in dates:
         data = get(f"/games/date/{day}", {"tz": "Europe/Belgrade"}).get("data", []) or []
         for game in data:
@@ -114,14 +120,14 @@ def main():
         competition_rows.append({
             "id": cid, "name": league.get("name") or league.get("slug"),
             "country": league.get("country"), "gender": league.get("gender"),
-            "level": league.get("type"), "source": "sportapi",
+            "level": league.get("type"), "source": SOURCE,
             "source_competition_id": lid, "active": True,
         })
         season = league.get("current_season")
         if season:
             season_rows.append({
                 "id": f"sportapi:season:{lid}:{season}", "competition_id": cid,
-                "season_name": str(season), "source": "sportapi",
+                "season_name": str(season), "source": SOURCE,
             })
 
     finished = []
@@ -136,7 +142,7 @@ def main():
                 team_rows.append({
                     "id": f"sportapi:team:{team['id']}",
                     "name": team.get("name") or str(team["id"]),
-                    "country": None, "source": "sportapi", "source_team_id": str(team["id"]),
+                    "country": None, "source": SOURCE, "source_team_id": str(team["id"]),
                 })
         game_rows.append({
             "id": f"sportapi:game:{game['id']}", "competition_season_id": season_id,
@@ -144,7 +150,7 @@ def main():
             "home_team_id": f"sportapi:team:{home['id']}" if home.get("id") is not None else None,
             "away_team_id": f"sportapi:team:{away['id']}" if away.get("id") is not None else None,
             "home_score": home.get("score"), "away_score": away.get("score"),
-            "status": game.get("status"), "source": "sportapi",
+            "status": game.get("status"), "source": SOURCE,
         })
         if str(game.get("status", "")).upper() in ("FT", "AOT") and game.get("has_boxscore"):
             finished.append(game)
@@ -156,47 +162,81 @@ def main():
     logging.info("EuroLeague: %d games; %d finished games advertise box scores", len(game_rows), len(finished))
 
     player_rows, box_rows = [], []
-    fetched_games = 0
-    skipped_games = 0
+    fetched_games = skipped_games = dnp_count = 0
     for game in finished:
-        if already_has_boxscore(game["id"]):
+        if already_has_v2_boxscore(game["id"]):
             skipped_games += 1
             continue
+
         payload = get(f"/games/{game['id']}/players")
         sides = payload.get("data") or {}
-        game_has_lines = False
+        game_rows_for_box = []
+        game_dnp = 0
+
         for side in ("home", "away"):
+            team_id = (game.get(side) or {}).get("id")
             for line in sides.get(side, []) or []:
                 player = line.get("player") or {}
                 pid = player.get("id")
                 if pid is None:
+                    logging.warning("Skipping player row without player ID in game %s", game["id"])
                     continue
+
                 player_key = f"sportapi:player:{pid}"
                 player_rows.append({
                     "id": player_key,
                     "full_name": player.get("name") or player.get("slug") or str(pid),
-                    "source": "sportapi", "source_player_id": str(pid),
+                    "source": SOURCE, "source_player_id": str(pid),
                 })
-                team_id = (game.get(side) or {}).get("id")
-                box_rows.append({
-                    "game_id": f"sportapi:game:{game['id']}", "player_id": player_key,
+
+                dnp_reason = line.get("dnp")
+                is_dnp = bool(dnp_reason)
+                if is_dnp:
+                    game_dnp += 1
+
+                game_rows_for_box.append({
+                    "game_id": f"sportapi:game:{game['id']}",
+                    "player_id": player_key,
                     "team_id": f"sportapi:team:{team_id}" if team_id is not None else None,
-                    "minutes": line.get("minutes"), "pts": line.get("pts"),
-                    "reb": line.get("reb"), "ast": line.get("ast"),
-                    "threes_made": line.get("tpm"), "stl": line.get("stl"),
-                    "blk": line.get("blk"), "tov": line.get("tov"),
-                    "pir": None, "source": "sportapi",
+                    "minutes": as_number(line.get("minutes")),
+                    "pts": as_number(line.get("pts")),
+                    "reb": as_number(line.get("reb")),
+                    "ast": as_number(line.get("ast")),
+                    "threes_made": as_number(line.get("tpm")),
+                    "stl": as_number(line.get("stl")),
+                    "blk": as_number(line.get("blk")),
+                    "tov": as_number(line.get("tov")),
+                    "pir": None,
+                    "fgm": as_number(line.get("fgm")),
+                    "fga": as_number(line.get("fga")),
+                    "tpm": as_number(line.get("tpm")),
+                    "tpa": as_number(line.get("tpa")),
+                    "ftm": as_number(line.get("ftm")),
+                    "fta": as_number(line.get("fta")),
+                    "oreb": as_number(line.get("oreb")),
+                    "dreb": as_number(line.get("dreb")),
+                    "pf": as_number(line.get("pf")),
+                    "plus_minus": as_number(line.get("plus_minus")),
+                    "starter": line.get("starter"),
+                    "position": player.get("position"),
+                    "jersey": player.get("jersey"),
+                    "dnp_reason": str(dnp_reason) if is_dnp else None,
+                    "ingestion_version": INGESTION_VERSION,
+                    "source": SOURCE,
                 })
-                game_has_lines = True
-        if game_has_lines:
+
+        if game_rows_for_box:
+            box_rows.extend(game_rows_for_box)
             fetched_games += 1
+            dnp_count += game_dnp
+            logging.info("Game %s: %d player rows, %d DNP", game["id"], len(game_rows_for_box), game_dnp)
         else:
-            logging.warning("No player lines returned for game %s; it may be retried tomorrow", game["id"])
+            logging.warning("No player rows returned for game %s; it may be retried tomorrow", game["id"])
 
     upsert("players", player_rows)
     upsert("player_boxscores", box_rows, "game_id,player_id,source")
-    logging.info("Fetched boxscore endpoints for %d games; skipped %d already stored games", fetched_games, skipped_games)
-    logging.info("Upserted %d players and %d player boxscore lines", len(deduplicate(player_rows, "id")), len(deduplicate(box_rows, "game_id,player_id,source")))
+    logging.info("Fetched expanded boxscores for %d games; skipped %d already v2 games", fetched_games, skipped_games)
+    logging.info("Upserted %d player rows; DNP rows: %d", len(deduplicate(player_rows, "id")), dnp_count)
 
 
 if __name__ == "__main__":
