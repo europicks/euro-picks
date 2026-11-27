@@ -34,7 +34,7 @@ def _ep_absence_number(value):
 
 def show_absence_impact(sb_client, selected_player_name):
     """Poredi statistiku igraca kada je potvrđeni saigrač igrao i kada je bio DNP."""
-    with st.expander("🧩 Uticaj odsutnog saigrača", expanded=False):
+    with st.expander("🧩 Uticaj odsutnog saigrača", expanded=True):
         st.caption(
             "Odsustvo se računa samo kada SportAPI ili SofaScore eksplicitno evidentira DNP / missing player. "
             "Samo odsustvo igrača iz boxscore-a nije dokaz da nije nastupio."
