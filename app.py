@@ -767,55 +767,6 @@ with tabs[1]:
                                   "tov":"TOV","blk":"BLK","pir":"PIR"}),
                  use_container_width=True, hide_index=True)
 
-    st.markdown("#### Detaljan učinak po utakmici")
-    detail_options = list(range(len(player_df)))
-    def game_detail_label(i):
-        row = player_df.iloc[i]
-        date_label = format_serbian_date(row["date"])
-        return f"{date_label} · {row['team']} – {row['opponent']}"
-    selected_detail_idx = st.selectbox(
-        "Izaberi utakmicu", detail_options,
-        format_func=game_detail_label, key="player_game_detail_select"
-    )
-    detail = player_df.iloc[selected_detail_idx]
-
-    def shooting_text(made, attempted):
-        made_value = safe_num(pd.Series([made])).iloc[0]
-        attempted_value = safe_num(pd.Series([attempted])).iloc[0]
-        if pd.isna(made_value) or pd.isna(attempted_value):
-            return "—"
-        pct = (made_value / attempted_value * 100) if attempted_value else 0
-        return f"{int(made_value)}/{int(attempted_value)} ({pct:.0f}%)"
-
-    st.markdown(f"**{int(detail['pts']) if pd.notna(detail['pts']) else '—'} poena** · {detail['team']} protiv {detail['opponent']} · {format_serbian_date(detail['date'])}")
-    shot_cols = st.columns(4)
-    shot_stats = [
-        ("Šutevi za 2", shooting_text(detail["fg2m"], detail["fg2a"])),
-        ("Trojke", shooting_text(detail["fg3m"], detail["fg3a"])),
-        ("Slobodna bacanja", shooting_text(detail["ftm"], detail["fta"])),
-        ("Šut iz igre", shooting_text(detail["fgm"], detail["fga"])),
-    ]
-    for col, (label, value) in zip(shot_cols, shot_stats):
-        col.metric(label, value)
-
-    other_cols = st.columns(5)
-    other_stats = [
-        ("Minuti", f"{detail['min']:.1f}" if pd.notna(detail["min"]) else "—"),
-        ("Skokovi", f"{int(detail['reb'])}" if pd.notna(detail["reb"]) else "—"),
-        ("Ofanzivni", f"{int(detail['oreb'])}" if pd.notna(detail["oreb"]) else "—"),
-        ("Defanzivni", f"{int(detail['dreb'])}" if pd.notna(detail["dreb"]) else "—"),
-        ("Asistencije", f"{int(detail['ast'])}" if pd.notna(detail["ast"]) else "—"),
-    ]
-    for col, (label, value) in zip(other_cols, other_stats):
-        col.metric(label, value)
-    extra_cols = st.columns(4)
-    extra_stats = [
-        ("Ukradene", detail["stl"]), ("Blokade", detail["blk"]),
-        ("Izgubljene", detail["tov"]), ("PIR", detail["pir"]),
-    ]
-    for col, (label, value) in zip(extra_cols, extra_stats):
-        col.metric(label, f"{int(value)}" if pd.notna(value) else "—")
-
 with tabs[2]:
     opp_stats = player_df.groupby("opponent").agg(
         utakmice=("player","count"), PTS=("pts","mean"), REB=("reb","mean"),
@@ -1001,6 +952,105 @@ with tabs[3]:
             )
 
 
+
+
+# --- VERIFIED GLOBAL BOX SCORE FOR THE SELECTED PLAYER ---
+with st.expander("📊 Detaljan boxscore po utakmici", expanded=False):
+    try:
+        matched_players = (
+            sb.table("players").select("id,full_name")
+            .ilike("full_name", chosen_player).limit(10).execute().data or []
+        )
+        matched_ids = [p["id"] for p in matched_players if p.get("id")]
+        global_rows = []
+        if matched_ids:
+            global_rows = (
+                sb.table("player_boxscores")
+                .select(
+                    "game_id,player_id,minutes,pts,reb,ast,fgm,fga,tpm,tpa,"
+                    "ftm,fta,oreb,dreb,stl,blk,tov,pf,plus_minus,dnp_reason,updated_at"
+                )
+                .in_("player_id", matched_ids)
+                .order("updated_at", desc=True)
+                .limit(30).execute().data or []
+            )
+
+        if not global_rows:
+            st.info("Detaljan boxscore još nije dostupan za ovog igrača u povezanoj bazi.")
+        else:
+            game_ids = list({r["game_id"] for r in global_rows if r.get("game_id")})
+            games_lookup = {}
+            if game_ids:
+                game_rows = (
+                    sb.table("games").select("id,start_time,home_team_id,away_team_id")
+                    .in_("id", game_ids).execute().data or []
+                )
+                games_lookup = {g["id"]: g for g in game_rows}
+
+            team_ids = list({
+                tid for g in games_lookup.values()
+                for tid in (g.get("home_team_id"), g.get("away_team_id")) if tid
+            })
+            team_lookup = {}
+            if team_ids:
+                team_rows = sb.table("teams").select("id,name").in_("id", team_ids).execute().data or []
+                team_lookup = {t["id"]: t.get("name", t["id"]) for t in team_rows}
+
+            display_rows = []
+            for r in global_rows:
+                game = games_lookup.get(r.get("game_id"), {})
+                raw_date = game.get("start_time") or r.get("updated_at")
+                try:
+                    match_date = format_serbian_date(raw_date, include_time=True)
+                except Exception:
+                    match_date = str(raw_date or "—")
+
+                dnp = r.get("dnp_reason")
+                def split(made, attempted):
+                    if made is None or attempted is None:
+                        return "—"
+                    pct = (100 * made / attempted) if attempted else 0
+                    return f"{made}/{attempted} ({pct:.0f}%)"
+
+                if dnp:
+                    display_rows.append({
+                        "Utakmica": match_date,
+                        "Status": f"DNP – {dnp}",
+                        "Min": "—", "PTS": "—", "REB": "—", "AST": "—",
+                        "Šut iz igre": "—", "2P": "—", "3P": "—", "FT": "—",
+                        "OREB": "—", "DREB": "—", "STL": "—", "BLK": "—",
+                        "TOV": "—", "+/-": "—",
+                    })
+                    continue
+
+                display_rows.append({
+                    "Utakmica": match_date,
+                    "Status": "Nastupio",
+                    "Min": r.get("minutes") if r.get("minutes") is not None else "—",
+                    "PTS": r.get("pts") if r.get("pts") is not None else "—",
+                    "REB": r.get("reb") if r.get("reb") is not None else "—",
+                    "AST": r.get("ast") if r.get("ast") is not None else "—",
+                    "Šut iz igre": split(r.get("fgm"), r.get("fga")),
+                    "2P": split(
+                        (r.get("fgm") - r.get("tpm"))
+                        if r.get("fgm") is not None and r.get("tpm") is not None else None,
+                        (r.get("fga") - r.get("tpa"))
+                        if r.get("fga") is not None and r.get("tpa") is not None else None,
+                    ),
+                    "3P": split(r.get("tpm"), r.get("tpa")),
+                    "FT": split(r.get("ftm"), r.get("fta")),
+                    "OREB": r.get("oreb") if r.get("oreb") is not None else "—",
+                    "DREB": r.get("dreb") if r.get("dreb") is not None else "—",
+                    "STL": r.get("stl") if r.get("stl") is not None else "—",
+                    "BLK": r.get("blk") if r.get("blk") is not None else "—",
+                    "TOV": r.get("tov") if r.get("tov") is not None else "—",
+                    "+/-": r.get("plus_minus") if r.get("plus_minus") is not None else "—",
+                })
+
+            st.dataframe(pd.DataFrame(display_rows), use_container_width=True, hide_index=True)
+            st.caption("Procenti šuta se računaju iz pogođenih/pokušanih šuteva. Nedostupni podaci ostaju označeni crticom.")
+    except Exception as exc:
+        st.info(f"Detaljan boxscore trenutno nije dostupan: {exc}")
 
 st.markdown("### 📈 Granice kladionica za ovog igrača")
 db_offers, offers_error = fetch_db_player_offers(chosen_player)
