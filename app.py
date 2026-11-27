@@ -767,6 +767,55 @@ with tabs[1]:
                                   "tov":"TOV","blk":"BLK","pir":"PIR"}),
                  use_container_width=True, hide_index=True)
 
+    st.markdown("#### Detaljan učinak po utakmici")
+    detail_options = list(range(len(player_df)))
+    def game_detail_label(i):
+        row = player_df.iloc[i]
+        date_label = format_serbian_date(row["date"])
+        return f"{date_label} · {row['team']} – {row['opponent']}"
+    selected_detail_idx = st.selectbox(
+        "Izaberi utakmicu", detail_options,
+        format_func=game_detail_label, key="player_game_detail_select"
+    )
+    detail = player_df.iloc[selected_detail_idx]
+
+    def shooting_text(made, attempted):
+        made_value = safe_num(pd.Series([made])).iloc[0]
+        attempted_value = safe_num(pd.Series([attempted])).iloc[0]
+        if pd.isna(made_value) or pd.isna(attempted_value):
+            return "—"
+        pct = (made_value / attempted_value * 100) if attempted_value else 0
+        return f"{int(made_value)}/{int(attempted_value)} ({pct:.0f}%)"
+
+    st.markdown(f"**{int(detail['pts']) if pd.notna(detail['pts']) else '—'} poena** · {detail['team']} protiv {detail['opponent']} · {format_serbian_date(detail['date'])}")
+    shot_cols = st.columns(4)
+    shot_stats = [
+        ("Šutevi za 2", shooting_text(detail["fg2m"], detail["fg2a"])),
+        ("Trojke", shooting_text(detail["fg3m"], detail["fg3a"])),
+        ("Slobodna bacanja", shooting_text(detail["ftm"], detail["fta"])),
+        ("Šut iz igre", shooting_text(detail["fgm"], detail["fga"])),
+    ]
+    for col, (label, value) in zip(shot_cols, shot_stats):
+        col.metric(label, value)
+
+    other_cols = st.columns(5)
+    other_stats = [
+        ("Minuti", f"{detail['min']:.1f}" if pd.notna(detail["min"]) else "—"),
+        ("Skokovi", f"{int(detail['reb'])}" if pd.notna(detail["reb"]) else "—"),
+        ("Ofanzivni", f"{int(detail['oreb'])}" if pd.notna(detail["oreb"]) else "—"),
+        ("Defanzivni", f"{int(detail['dreb'])}" if pd.notna(detail["dreb"]) else "—"),
+        ("Asistencije", f"{int(detail['ast'])}" if pd.notna(detail["ast"]) else "—"),
+    ]
+    for col, (label, value) in zip(other_cols, other_stats):
+        col.metric(label, value)
+    extra_cols = st.columns(4)
+    extra_stats = [
+        ("Ukradene", detail["stl"]), ("Blokade", detail["blk"]),
+        ("Izgubljene", detail["tov"]), ("PIR", detail["pir"]),
+    ]
+    for col, (label, value) in zip(extra_cols, extra_stats):
+        col.metric(label, f"{int(value)}" if pd.notna(value) else "—")
+
 with tabs[2]:
     opp_stats = player_df.groupby("opponent").agg(
         utakmice=("player","count"), PTS=("pts","mean"), REB=("reb","mean"),
