@@ -7,6 +7,157 @@ import html
 import re
 import unicodedata
 
+
+
+# --- EURO PICKS: analiza uticaja odsutnih saigraca (ugradjeno u app.py) ---
+def _ep_absence_chunks(values, size=100):
+    values = list(dict.fromkeys(v for v in values if v))
+    for start in range(0, len(values), size):
+        yield values[start:start + size]
+
+
+def _ep_absence_fetch(sb_client, table, select, column, values, limit=10000):
+    found = []
+    for part in _ep_absence_chunks(values):
+        if part:
+            response = sb_client.table(table).select(select).in_(column, part).limit(limit).execute()
+            found.extend(response.data or [])
+    return found
+
+
+def _ep_absence_number(value):
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def show_absence_impact(sb_client, selected_player_name):
+    """Poredi statistiku igraca kada je potvrđeni saigrač igrao i kada je bio DNP."""
+    with st.expander("🧩 Uticaj odsutnog saigrača", expanded=False):
+        st.caption(
+            "Odsustvo se računa samo kada SportAPI ili SofaScore eksplicitno evidentira DNP / missing player. "
+            "Samo odsustvo igrača iz boxscore-a nije dokaz da nije nastupio."
+        )
+        try:
+            players = (sb_client.table("players").select("id,full_name")
+                       .ilike("full_name", str(selected_player_name)).limit(30).execute().data or [])
+            target_ids = [p["id"] for p in players if p.get("id")]
+            if not target_ids:
+                st.info("Igrač još nema povezane utakmice u globalnoj bazi.")
+                return
+
+            target_rows = _ep_absence_fetch(
+                sb_client, "player_boxscores",
+                "game_id,player_id,team_id,minutes,pts,reb,ast,tpm,pir,dnp_reason,source,updated_at",
+                "player_id", target_ids
+            )
+            target_rows = [r for r in target_rows if r.get("game_id")]
+            if not target_rows:
+                st.info("Još nema sačuvanih boxscore utakmica za ovog igrača.")
+                return
+
+            game_ids = list(dict.fromkeys(r["game_id"] for r in target_rows))
+            games = _ep_absence_fetch(
+                sb_client, "games", "id,start_time,home_team_id,away_team_id,home_score,away_score", "id", game_ids
+            )
+            game_map = {g["id"]: g for g in games}
+            source_rank = {"sportapi": 0, "sofascore": 1}
+            target_by_game = {}
+            for row in target_rows:
+                if row.get("dnp_reason") or row.get("game_id") not in game_map:
+                    continue
+                gid = row["game_id"]
+                old = target_by_game.get(gid)
+                if old is None or source_rank.get(str(row.get("source") or "").lower(), 9) < source_rank.get(str(old.get("source") or "").lower(), 9):
+                    target_by_game[gid] = row
+            if not target_by_game:
+                st.info("Nema odigranih utakmica ovog igrača u povezanoj bazi.")
+                return
+
+            ordered = sorted(
+                target_by_game,
+                key=lambda gid: str((game_map.get(gid) or {}).get("start_time") or ""),
+                reverse=True
+            )
+            latest_game_id = ordered[0]
+            latest_game = game_map[latest_game_id]
+            latest_rows = _ep_absence_fetch(
+                sb_client, "player_boxscores",
+                "game_id,player_id,team_id,minutes,dnp_reason,source",
+                "game_id", [latest_game_id], limit=1000
+            )
+            latest_target = target_by_game[latest_game_id]
+            selected_team = latest_target.get("team_id")
+            latest_dnp = [
+                r for r in latest_rows
+                if r.get("player_id") not in target_ids and r.get("dnp_reason")
+                and (not selected_team or r.get("team_id") == selected_team)
+            ]
+            if not latest_dnp:
+                st.info("Za poslednju utakmicu nema eksplicitno evidentiranih DNP saigrača.")
+                return
+
+            teammate_ids = list(dict.fromkeys(r.get("player_id") for r in latest_dnp if r.get("player_id")))
+            all_rows = _ep_absence_fetch(
+                sb_client, "player_boxscores",
+                "game_id,player_id,team_id,minutes,pts,reb,ast,tpm,pir,dnp_reason,source",
+                "game_id", ordered, limit=10000
+            )
+            name_rows = _ep_absence_fetch(sb_client, "players", "id,full_name", "id", teammate_ids)
+            names = {p["id"]: p.get("full_name") or p["id"] for p in name_rows}
+            choices = sorted({names.get(pid, pid) for pid in teammate_ids})
+            chosen = st.selectbox("Saigrač koji nije nastupio u poslednjoj utakmici", choices, key="ep_absence_teammate_inline")
+            chosen_ids = {pid for pid in teammate_ids if names.get(pid, pid) == chosen}
+
+            status_by_game = {}
+            for row in all_rows:
+                if row.get("player_id") not in chosen_ids:
+                    continue
+                gid = row.get("game_id")
+                state = status_by_game.setdefault(gid, {"dnp": False, "played": False})
+                if row.get("dnp_reason"):
+                    state["dnp"] = True
+                elif (_ep_absence_number(row.get("minutes")) or 0) > 0:
+                    state["played"] = True
+
+            stat_choice = st.selectbox(
+                "Statistika za poređenje", ["Poeni", "Skokovi", "Asistencije", "Trojke", "PIR", "PRA"],
+                key="ep_absence_stat_inline"
+            )
+            stat_cols = {
+                "Poeni": ("pts",), "Skokovi": ("reb",), "Asistencije": ("ast",),
+                "Trojke": ("tpm",), "PIR": ("pir",), "PRA": ("pts", "reb", "ast")
+            }
+            without_values, with_values = [], []
+            for gid, target in target_by_game.items():
+                status = status_by_game.get(gid)
+                if not status:
+                    continue
+                cols = stat_cols[stat_choice]
+                values = [_ep_absence_number(target.get(col)) for col in cols]
+                if any(v is None for v in values):
+                    continue
+                value = sum(values)
+                if status["dnp"]:
+                    without_values.append(value)
+                elif status["played"]:
+                    with_values.append(value)
+
+            avg_without = sum(without_values) / len(without_values) if without_values else None
+            avg_with = sum(with_values) / len(with_values) if with_values else None
+            c1, c2 = st.columns(2)
+            c1.metric(f"{stat_choice} bez {chosen}", f"{avg_without:.1f}" if avg_without is not None else "—", f"{len(without_values)} utakmica")
+            c2.metric(f"{stat_choice} sa {chosen}", f"{avg_with:.1f}" if avg_with is not None else "—", f"{len(with_values)} utakmica")
+            if avg_without is not None and avg_with is not None:
+                st.metric("Razlika proseka", f"{avg_without - avg_with:+.1f}")
+            else:
+                st.info("Još nema dovoljno utakmica sa potvrđenim statusom ovog saigrača. Podaci se prikupljaju kroz dnevno osvežavanje.")
+            st.caption(f"Poslednja obrađena utakmica: {latest_game.get('start_time') or 'datum nije dostupan'} · izvori: SportAPI + SofaScore")
+        except Exception as exc:
+            st.warning(f"Analiza odsustva trenutno nije dostupna: {exc}")
+
+
 st.set_page_config(page_title="EURO PICKS", page_icon="🏀", layout="wide")
 
 # --- EURO PICKS access control (Supabase Auth + database-backed Premium) ---
@@ -332,14 +483,19 @@ st.markdown("""
   <div class="ep-live"><i></i> LIVE DATA</div>
 </div>
 """, unsafe_allow_html=True)
-st.caption("EUROLEAGUE ANALYTICS • Podaci se prikazuju prema poslednjem dostupnom ažuriranju izvora.")
+st.caption("EUROLEAGUE ANALYTICS • Dnevno osvežavanje: prvi zahtev nakon 00:00 (Europe/Belgrade).")
 
 YEARS = list(range(2026, 2006, -1))
 BASE = "https://675hoops.com/downloads/player_box-{}.csv.gz"
 TEAM_BASE = "https://675hoops.com/downloads/team_games-{}.csv.gz"
 
-@st.cache_data(ttl=900, show_spinner=False)
-def load_seasons(years):
+def belgrade_day_key():
+    """Cache key changes at midnight in Serbia, including daylight-saving changes."""
+    return datetime.now(ZoneInfo("Europe/Belgrade")).date().isoformat()
+
+
+@st.cache_data(show_spinner=False, max_entries=2)
+def load_seasons(years, refresh_day):
     frames, team_frames, errors = [], [], []
     for year in years:
         try:
@@ -364,9 +520,10 @@ def load_seasons(years):
     team_data = pd.concat(team_frames, ignore_index=True) if team_frames else pd.DataFrame()
     return data, team_data, errors
 
-@st.cache_data(ttl=900, show_spinner=False)
-def load_data():
-    return load_seasons(YEARS)
+@st.cache_data(show_spinner=False, max_entries=2)
+def load_data(refresh_day):
+    # A new cache entry is created on the first app request after local midnight.
+    return load_seasons(YEARS, refresh_day)
 
 def safe_num(series):
     return pd.to_numeric(series, errors="coerce").fillna(0)
@@ -489,20 +646,27 @@ def fetch_db_player_offers(player_name):
         return pd.DataFrame(), f"Ponude iz baze trenutno nisu dostupne: {exc}"
 
 
+@st.cache_data(show_spinner=False, max_entries=2)
+def load_upcoming_database_games(refresh_day):
+    """Read upcoming fixtures once per Belgrade calendar day."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    games = (sb.table("games").select(
+        "id,start_time,status,home_score,away_score,home_team_id,away_team_id,competition_season_id"
+    ).gte("start_time", now_iso).order("start_time").limit(50).execute().data or [])
+    team_ids = list({x for g in games for x in [g.get("home_team_id"), g.get("away_team_id")] if x})
+    teams = sb.table("teams").select("id,name").in_("id", team_ids).execute().data or [] if team_ids else []
+    team_map = {t["id"]: t["name"] for t in teams}
+    return games, team_map
+
+
 def show_upcoming_database_games():
-    """Show upcoming fixtures already ingested into the global Supabase schema."""
+    """Show upcoming fixtures refreshed on the first request after midnight."""
     st.markdown("### 🗓️ Predstojeće utakmice")
     try:
-        now_iso = datetime.now(timezone.utc).isoformat()
-        games = (sb.table("games").select(
-            "id,start_time,status,home_score,away_score,home_team_id,away_team_id,competition_season_id"
-        ).gte("start_time", now_iso).order("start_time").limit(50).execute().data or [])
+        games, team_map = load_upcoming_database_games(belgrade_day_key())
         if not games:
             st.info("Još nema predstojećih utakmica u globalnoj bazi. Raspored će se prikazati kada se poveže i pokrene izvor za to takmičenje.")
             return
-        team_ids = list({x for g in games for x in [g.get("home_team_id"), g.get("away_team_id")] if x})
-        teams = sb.table("teams").select("id,name").in_("id", team_ids).execute().data or [] if team_ids else []
-        team_map = {t["id"]: t["name"] for t in teams}
         rows = []
         belgrade_tz = ZoneInfo("Europe/Belgrade")
         for g in games:
@@ -554,7 +718,7 @@ if chosen_competition != "EuroLeague":
 
 with st.spinner("Proveravam najnovije objavljene box score podatke..."):
     try:
-        all_data, team_data, load_errors = load_data()
+        all_data, team_data, load_errors = load_data(belgrade_day_key())
     except Exception as e:
         st.error(str(e))
         st.stop()
@@ -666,6 +830,9 @@ if player_df.empty:
     st.stop()
 
 latest = player_df.iloc[0]
+
+# Separate module: confirmed teammate-absence impact analysis.
+show_absence_impact(sb, chosen_player)
 # Season/filtered averages and recent form
 last5 = player_df.head(5)
 last10 = player_df.head(10)
@@ -766,6 +933,55 @@ with tabs[1]:
                                   "reb":"REB","ast":"AST","3pm":"3PM","3pa":"3PA","stl":"STL",
                                   "tov":"TOV","blk":"BLK","pir":"PIR"}),
                  use_container_width=True, hide_index=True)
+
+    st.markdown("#### Detaljan učinak po utakmici")
+    detail_options = list(range(len(player_df)))
+    def game_detail_label(i):
+        row = player_df.iloc[i]
+        date_label = format_serbian_date(row["date"])
+        return f"{date_label} · {row['team']} – {row['opponent']}"
+    selected_detail_idx = st.selectbox(
+        "Izaberi utakmicu", detail_options,
+        format_func=game_detail_label, key="player_game_detail_select"
+    )
+    detail = player_df.iloc[selected_detail_idx]
+
+    def shooting_text(made, attempted):
+        made_value = safe_num(pd.Series([made])).iloc[0]
+        attempted_value = safe_num(pd.Series([attempted])).iloc[0]
+        if pd.isna(made_value) or pd.isna(attempted_value):
+            return "—"
+        pct = (made_value / attempted_value * 100) if attempted_value else 0
+        return f"{int(made_value)}/{int(attempted_value)} ({pct:.0f}%)"
+
+    st.markdown(f"**{int(detail['pts']) if pd.notna(detail['pts']) else '—'} poena** · {detail['team']} protiv {detail['opponent']} · {format_serbian_date(detail['date'])}")
+    shot_cols = st.columns(4)
+    shot_stats = [
+        ("Šutevi za 2", shooting_text(detail["fg2m"], detail["fg2a"])),
+        ("Trojke", shooting_text(detail["fg3m"], detail["fg3a"])),
+        ("Slobodna bacanja", shooting_text(detail["ftm"], detail["fta"])),
+        ("Šut iz igre", shooting_text(detail["fgm"], detail["fga"])),
+    ]
+    for col, (label, value) in zip(shot_cols, shot_stats):
+        col.metric(label, value)
+
+    other_cols = st.columns(5)
+    other_stats = [
+        ("Minuti", f"{detail['min']:.1f}" if pd.notna(detail["min"]) else "—"),
+        ("Skokovi", f"{int(detail['reb'])}" if pd.notna(detail["reb"]) else "—"),
+        ("Ofanzivni", f"{int(detail['oreb'])}" if pd.notna(detail["oreb"]) else "—"),
+        ("Defanzivni", f"{int(detail['dreb'])}" if pd.notna(detail["dreb"]) else "—"),
+        ("Asistencije", f"{int(detail['ast'])}" if pd.notna(detail["ast"]) else "—"),
+    ]
+    for col, (label, value) in zip(other_cols, other_stats):
+        col.metric(label, value)
+    extra_cols = st.columns(4)
+    extra_stats = [
+        ("Ukradene", detail["stl"]), ("Blokade", detail["blk"]),
+        ("Izgubljene", detail["tov"]), ("PIR", detail["pir"]),
+    ]
+    for col, (label, value) in zip(extra_cols, extra_stats):
+        col.metric(label, f"{int(value)}" if pd.notna(value) else "—")
 
 with tabs[2]:
     opp_stats = player_df.groupby("opponent").agg(
@@ -952,105 +1168,6 @@ with tabs[3]:
             )
 
 
-
-
-# --- VERIFIED GLOBAL BOX SCORE FOR THE SELECTED PLAYER ---
-with st.expander("📊 Detaljan boxscore po utakmici", expanded=False):
-    try:
-        matched_players = (
-            sb.table("players").select("id,full_name")
-            .ilike("full_name", chosen_player).limit(10).execute().data or []
-        )
-        matched_ids = [p["id"] for p in matched_players if p.get("id")]
-        global_rows = []
-        if matched_ids:
-            global_rows = (
-                sb.table("player_boxscores")
-                .select(
-                    "game_id,player_id,minutes,pts,reb,ast,fgm,fga,tpm,tpa,"
-                    "ftm,fta,oreb,dreb,stl,blk,tov,pf,plus_minus,dnp_reason,updated_at"
-                )
-                .in_("player_id", matched_ids)
-                .order("updated_at", desc=True)
-                .limit(30).execute().data or []
-            )
-
-        if not global_rows:
-            st.info("Detaljan boxscore još nije dostupan za ovog igrača u povezanoj bazi.")
-        else:
-            game_ids = list({r["game_id"] for r in global_rows if r.get("game_id")})
-            games_lookup = {}
-            if game_ids:
-                game_rows = (
-                    sb.table("games").select("id,start_time,home_team_id,away_team_id")
-                    .in_("id", game_ids).execute().data or []
-                )
-                games_lookup = {g["id"]: g for g in game_rows}
-
-            team_ids = list({
-                tid for g in games_lookup.values()
-                for tid in (g.get("home_team_id"), g.get("away_team_id")) if tid
-            })
-            team_lookup = {}
-            if team_ids:
-                team_rows = sb.table("teams").select("id,name").in_("id", team_ids).execute().data or []
-                team_lookup = {t["id"]: t.get("name", t["id"]) for t in team_rows}
-
-            display_rows = []
-            for r in global_rows:
-                game = games_lookup.get(r.get("game_id"), {})
-                raw_date = game.get("start_time") or r.get("updated_at")
-                try:
-                    match_date = format_serbian_date(raw_date, include_time=True)
-                except Exception:
-                    match_date = str(raw_date or "—")
-
-                dnp = r.get("dnp_reason")
-                def split(made, attempted):
-                    if made is None or attempted is None:
-                        return "—"
-                    pct = (100 * made / attempted) if attempted else 0
-                    return f"{made}/{attempted} ({pct:.0f}%)"
-
-                if dnp:
-                    display_rows.append({
-                        "Utakmica": match_date,
-                        "Status": f"DNP – {dnp}",
-                        "Min": "—", "PTS": "—", "REB": "—", "AST": "—",
-                        "Šut iz igre": "—", "2P": "—", "3P": "—", "FT": "—",
-                        "OREB": "—", "DREB": "—", "STL": "—", "BLK": "—",
-                        "TOV": "—", "+/-": "—",
-                    })
-                    continue
-
-                display_rows.append({
-                    "Utakmica": match_date,
-                    "Status": "Nastupio",
-                    "Min": r.get("minutes") if r.get("minutes") is not None else "—",
-                    "PTS": r.get("pts") if r.get("pts") is not None else "—",
-                    "REB": r.get("reb") if r.get("reb") is not None else "—",
-                    "AST": r.get("ast") if r.get("ast") is not None else "—",
-                    "Šut iz igre": split(r.get("fgm"), r.get("fga")),
-                    "2P": split(
-                        (r.get("fgm") - r.get("tpm"))
-                        if r.get("fgm") is not None and r.get("tpm") is not None else None,
-                        (r.get("fga") - r.get("tpa"))
-                        if r.get("fga") is not None and r.get("tpa") is not None else None,
-                    ),
-                    "3P": split(r.get("tpm"), r.get("tpa")),
-                    "FT": split(r.get("ftm"), r.get("fta")),
-                    "OREB": r.get("oreb") if r.get("oreb") is not None else "—",
-                    "DREB": r.get("dreb") if r.get("dreb") is not None else "—",
-                    "STL": r.get("stl") if r.get("stl") is not None else "—",
-                    "BLK": r.get("blk") if r.get("blk") is not None else "—",
-                    "TOV": r.get("tov") if r.get("tov") is not None else "—",
-                    "+/-": r.get("plus_minus") if r.get("plus_minus") is not None else "—",
-                })
-
-            st.dataframe(pd.DataFrame(display_rows), use_container_width=True, hide_index=True)
-            st.caption("Procenti šuta se računaju iz pogođenih/pokušanih šuteva. Nedostupni podaci ostaju označeni crticom.")
-    except Exception as exc:
-        st.info(f"Detaljan boxscore trenutno nije dostupan: {exc}")
 
 st.markdown("### 📈 Granice kladionica za ovog igrača")
 db_offers, offers_error = fetch_db_player_offers(chosen_player)
