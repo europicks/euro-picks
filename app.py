@@ -831,8 +831,6 @@ if player_df.empty:
 
 latest = player_df.iloc[0]
 
-# Separate module: confirmed teammate-absence impact analysis.
-show_absence_impact(sb, chosen_player)
 # Season/filtered averages and recent form
 last5 = player_df.head(5)
 last10 = player_df.head(10)
@@ -933,6 +931,9 @@ with tabs[1]:
                                   "reb":"REB","ast":"AST","3pm":"3PM","3pa":"3PA","stl":"STL",
                                   "tov":"TOV","blk":"BLK","pir":"PIR"}),
                  use_container_width=True, hide_index=True)
+
+    # Analiza odsustva pripada tabu Poslednje utakmice, odmah ispod tabele.
+    show_absence_impact(sb, chosen_player)
 
     st.markdown("#### Detaljan učinak po utakmici")
     detail_options = list(range(len(player_df)))
