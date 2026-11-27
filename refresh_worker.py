@@ -103,39 +103,37 @@ def main():
     logging.info("EuroLeague competitions selected: %s", [x.get("name") for x in euro_leagues])
 
     today = datetime.now(ZoneInfo("Europe/Belgrade")).date()
-    dates = [(today + timedelta(days=offset)).isoformat() for offset in (-1, 0, 1, 2)]
+    wanted_dates = {(today + timedelta(days=offset)).isoformat() for offset in (-1, 0, 1, 2)}
     games_by_id = {}
-    for day in dates:
-        # SportAPI supports filtering this endpoint by league slug.
-        # Use the canonical EuroLeague slug so we do not depend on a
-        # potentially inconsistent league ID in the date response.
-        date_payload = get(
-            f"/games/date/{day}",
-            {"tz": "Europe/Belgrade", "league": "euroleague"},
-        )
-        data = date_payload.get("data", []) or []
-        logging.info("EuroLeague date %s: API returned %d games", day, len(data))
-        for game in data:
-            if game.get("id") is None:
-                continue
-            league = game.get("league") or {}
-            league_slug = str(league.get("slug") or "").strip().lower()
-            league_name = str(league.get("name") or "").strip().lower()
-            league_id = str(league.get("id")) if league.get("id") is not None else None
 
-            # Trust the server-side league filter when metadata is partial.
-            # Reject only an explicit different league.
-            explicit_other = (
-                (league_slug and league_slug != "euroleague")
-                or (league_name and league_name not in {
-                    "euroleague", "euro league", "turkish airlines euroleague"
-                })
-                or (league_id and league_id not in euro_ids and league_slug != "euroleague"
-                    and league_name not in {
-                        "euroleague", "euro league", "turkish airlines euroleague"
-                    })
-            )
-            if not explicit_other:
+    # Use the league's own schedule/results endpoint instead of the global
+    # date endpoint, which returned an empty data array for every requested day.
+    # The league endpoint supports separate finished and scheduled lists.
+    for league in euro_leagues:
+        slug = league.get("slug") or "euroleague"
+        season = league.get("current_season")
+        for status in ("finished", "scheduled"):
+            params = {"status": status, "limit": 200}
+            if season:
+                params["season"] = str(season)
+            payload = get(f"/leagues/{slug}/games", params)
+            data = payload.get("data", []) or []
+            logging.info("EuroLeague %s endpoint (%s): API returned %d games", status, season, len(data))
+            for game in data:
+                if game.get("id") is None:
+                    continue
+                start_value = game.get("start") or game.get("date")
+                if start_value:
+                    try:
+                        start_dt = datetime.fromisoformat(str(start_value).replace("Z", "+00:00"))
+                        if start_dt.tzinfo is None:
+                            start_dt = start_dt.replace(tzinfo=ZoneInfo("UTC"))
+                        local_day = start_dt.astimezone(ZoneInfo("Europe/Belgrade")).date().isoformat()
+                        if local_day not in wanted_dates:
+                            continue
+                    except (TypeError, ValueError):
+                        logging.warning("Could not parse game date %r for game %s", start_value, game.get("id"))
+                        continue
                 games_by_id[str(game["id"])] = game
 
     season_by_league = {str(x.get("id")): x.get("current_season") for x in euro_leagues}
